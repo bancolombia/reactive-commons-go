@@ -1,0 +1,25 @@
+# Go binaries and test artifacts
+*.exe
+*.test
+*.out
+*.prof
+
+# Module download cache
+vendor/
+
+# Build output
+dist/
+bin/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test coverage
+coverage.out
+coverage.html
