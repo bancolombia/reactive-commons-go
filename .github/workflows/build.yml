@@ -1,0 +1,100 @@
+name: build
+
+on:
+  push:
+    branches:
+      - main
+      - feature/*
+      - fix/*
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build:
+    if: ${{ !contains(github.event.head_commit.message, '[skip ci]') }}
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate a token
+        id: generate_token
+        if: github.ref == 'refs/heads/main'
+        uses: tibdex/github-app-token@v2
+        with:
+          app_id: ${{ secrets.APP_ID_ADMIN_GITHUB }}
+          private_key: ${{ secrets.APP_PRIVATE_KEY_ADMIN_GITHUB }}
+      - uses: actions/checkout@v4
+        if: github.ref == 'refs/heads/main'
+        with:
+          token: ${{ steps.generate_token.outputs.token }}
+          fetch-depth: 0
+      - uses: actions/checkout@v4
+        if: github.ref != 'refs/heads/main'
+
+      - name: Verify Conventional Commits
+        uses: amannn/action-semantic-pull-request@v5
+        if: github.event_name == 'pull_request' || github.event_name == 'pull_request_target'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up NodeJS
+        if: github.ref == 'refs/heads/main'
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+
+      - name: Set up Semantic Release
+        if: github.ref == 'refs/heads/main'
+        run: npm -g install @semantic-release/git semantic-release@23.0.0
+
+      - name: Semantic Release
+        if: github.ref == 'refs/heads/main'
+        run: npx semantic-release@23.0.0
+        env:
+          GITHUB_TOKEN: ${{ steps.generate_token.outputs.token }}
+
+      - name: Setup Go 1.25.x
+        uses: actions/setup-go@v5
+        with:
+          # Semantic version range syntax or exact version of Go
+          go-version: '1.25.x'
+
+      - name: Install dependencies
+        run: go mod download
+
+      - name: Build
+        run: go build -v ./...
+
+      - name: Go Vet
+        run: |
+          go vet ./...
+
+      - name: Test and generate coverage
+        run: go test -race -covermode=atomic -coverprofile=coverage.out ./...
+
+#      - name: Upload coverage to Codecov
+#        uses: codecov/codecov-action@v5
+#        with:
+#          # token: ${{ secrets.CODECOV_TOKEN }}
+#          files: ./coverage.out
+
+      - name: Analyze with SonarQube
+        uses: SonarSource/sonarqube-scan-action@v6 # Use the official action
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          # Project metadata can be defined here or in a sonar-project.properties file
+          args: >
+            -Dsonar.projectKey=bancolombia_reactive-commons-go
+            -Dsonar.organization=grupo-bancolombia
+            -Dsonar.sources=.
+            -Dsonar.coverage.exclusions=**/*_test.go,**/examples/*.go
+            -Dsonar.exclusions=**/*_test.go,**/examples/*.go
+            -Dsonar.tests=.
+            -Dsonar.test.inclusions=**/*_test.go
+            -Dsonar.go.coverage.reportPaths=coverage.out
+            -Dsonar.qualitygate.wait=true
+            -Dsonar.branch.name=${{ github.ref_name }}

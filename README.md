@@ -5,6 +5,8 @@ messaging patterns for RabbitMQ, wire-compatible with `reactive-commons-java`.
 
 Provides four async messaging patterns — **domain events**, **commands**, **async queries (request/reply)**, and **notifications** — over a single RabbitMQ broker, with zero extra infrastructure.
 
+**DISCLAIMER**: This project its currently in a alpha stage and not ready to use in production-grade components. 
+
 ## Installation
 
 ```bash
