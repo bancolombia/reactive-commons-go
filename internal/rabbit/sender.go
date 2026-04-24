@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
@@ -86,6 +87,7 @@ func (s *Sender) SendWithConfirm(ctx context.Context, body []byte, exchange, rou
 		ContentType:  "application/json",
 		DeliveryMode: uint8(mode),
 		Timestamp:    time.Now(),
+		MessageId:    uuid.NewString(),
 		Headers:      headers,
 		AppId:        s.cfg.AppName,
 		Body:         body,
@@ -124,6 +126,7 @@ func (s *Sender) SendNoConfirm(ctx context.Context, body []byte, exchange, routi
 		ContentType:  "application/json",
 		DeliveryMode: uint8(mode),
 		Timestamp:    time.Now(),
+		MessageId:    uuid.NewString(),
 		Headers:      headers,
 		AppId:        s.cfg.AppName,
 		Body:         body,

@@ -131,16 +131,27 @@ This matches the `reactive-commons-java` `Command` serialization format. A Java 
 
 ---
 
-## Dead-Letter Queue (Optional)
+## Dead-Letter Queue and Delayed Retry (Optional)
 
-Enable DLQ retry to capture failed commands for later inspection:
+Enable DLQ retry to delay-redeliver failed commands instead of looping immediately:
 
 ```go
 cfg.WithDLQRetry = true
 cfg.RetryDelay   = 5 * time.Second
 ```
 
-The DLQ exchange `directMessages.DLQ` and queue `{appName}.DLQ` are declared automatically.
+When enabled, the topology mirrors `reactive-commons-java`'s
+`ApplicationCommandListener`:
+
+| Object | Type | Notes |
+|--------|------|-------|
+| `{directMessagesExchange}.DLQ` | direct, durable | Shared DLQ exchange (also used by queries) |
+| `{appName}` | durable | Origin queue, dead-letters to the DLQ exchange |
+| `{appName}.DLQ` | durable | DLQ queue, has `x-message-ttl=RetryDelay` and dead-letters back to `directMessages` |
+
+After the TTL expires the broker re-publishes the message to
+`directMessages` with the original routing key (`{appName}`), which routes it
+back to the origin queue for another attempt.
 
 ---
 
@@ -151,6 +162,27 @@ By default, commands are persistent (delivery-mode 2). To disable:
 ```go
 cfg.PersistentCommands = false
 ```
+
+---
+
+## Wildcard Command Names
+
+Command handler names may contain RabbitMQ topic-style wildcards (`*` for one
+segment, `#` for zero or more). Because commands always route to a service by
+its `AppName` on the direct exchange, wildcards affect only **dispatch-time
+handler lookup** inside the receiving service — broker routing is unchanged.
+
+```go
+_ = app.Registry().ListenCommand("invoice.*", func(ctx context.Context, c async.Command[any]) error {
+    // fires for "invoice.create", "invoice.cancel", ...
+    return nil
+})
+```
+
+Resolution follows the same rules as events: exact name wins; otherwise the
+most specific matching pattern is selected. See
+[domain-events.md](domain-events.md#wildcard-subscriptions) for the full
+ranking semantics.
 
 ---
 

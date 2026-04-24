@@ -17,3 +17,9 @@ var ErrBrokerUnavailable = errors.New("reactive-commons: broker connection unava
 // ErrDeserialize is returned when an incoming message body cannot be unmarshaled
 // into the expected target type.
 var ErrDeserialize = errors.New("reactive-commons: failed to deserialize message payload")
+
+// ErrWildcardNotSupported is returned by ServeQuery when the query name
+// contains a RabbitMQ wildcard ('*' or '#'). Queries are routed through
+// the direct exchange and cannot be addressed via topic patterns; this
+// matches reactive-commons-java's HandlerResolver.addQueryHandler check.
+var ErrWildcardNotSupported = errors.New("reactive-commons: wildcards are not supported in query handler names")

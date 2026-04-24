@@ -11,9 +11,15 @@ as they share the same exchange names (the defaults match).
 
 Both implementations use:
 
-- The same AMQP exchange topology (`domainEvents`, `directMessages`, `globalReply`)
+- The same AMQP exchange topology with the same types and durability:
+  - `domainEvents` — topic, durable
+  - `directMessages` — direct, durable
+  - `globalReply` — topic, durable
 - The same JSON message envelope field names (verified against Jackson serialization)
 - The same AMQP header names for query correlation
+- The same DLQ/retry topology when `WithDLQRetry=true` (per-app retry exchange
+  for events; shared `{directMessages}.DLQ` for commands and queries; TTL-based
+  redelivery)
 
 No adapter, bridge, or SDK shim is required. Mixing Go and Java services is transparent.
 
@@ -31,6 +37,7 @@ No adapter, bridge, or SDK shim is required. Mixing Go and Java services is tran
 | `@HandleQuery` | `app.Gateway().RequestReply(...)` |
 | Notification broadcast | `app.Registry().ListenNotification(...)` handler fires |
 | `@HandleNotification` | `app.EventBus().EmitNotification(...)` |
+| Wildcard names (`order.*`, `inventory.#`) on events/commands/notifications | Same — see `internal/matcher` (port of Java `KeyMatcher`); queries reject wildcards on both sides |
 
 ---
 

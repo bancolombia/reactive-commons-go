@@ -398,3 +398,78 @@ func TestEvents_HandlerReturnsError_MessageRedelivered(t *testing.T) {
 	assert.Eventually(t, func() bool { return successCount.Load() >= 1 }, 15*time.Second, 100*time.Millisecond,
 		"event handler error: consumer did not redeliver and succeed")
 }
+
+// TestEvents_WildcardSubscription_ReceivesMatchingEvents verifies that a
+// handler registered with a RabbitMQ topic pattern (e.g. "order.*") fires
+// for matching concrete event names. Uses the broker-side topic binding
+// directly: registering "order.*" creates an AMQP binding with that key
+// against the durable domainEvents exchange.
+func TestEvents_WildcardSubscription_ReceivesMatchingEvents(t *testing.T) {
+	cfg := rabbit.NewConfigWithDefaults()
+	cfg.AppName = fmt.Sprintf("test-wildcard-%d", time.Now().UnixNano())
+	cfg.Host = rabbitHost
+	cfg.Port = rabbitPort
+
+	app, err := rabbit.NewApplication(cfg)
+	require.NoError(t, err)
+
+	var matched, unmatched atomic.Int32
+	matchedNames := make(chan string, 4)
+
+	err = app.Registry().ListenEvent("order.*", func(ctx context.Context, e async.DomainEvent[any]) error {
+		matched.Add(1)
+		matchedNames <- e.Name
+		return nil
+	})
+	require.NoError(t, err)
+
+	// A second pattern that should NOT match "order.*" deliveries.
+	err = app.Registry().ListenEvent("invoice.#", func(ctx context.Context, e async.DomainEvent[any]) error {
+		unmatched.Add(1)
+		return nil
+	})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() { _ = app.Start(ctx) }()
+
+	select {
+	case <-app.Ready():
+	case <-time.After(30 * time.Second):
+		t.Fatal("app not ready")
+	}
+
+	// Emit two events that the topic binding "order.*" should deliver.
+	for _, name := range []string{"order.created", "order.cancelled"} {
+		err = app.EventBus().Emit(ctx, async.DomainEvent[any]{
+			Name:    name,
+			EventID: name + "-id",
+			Data:    map[string]any{"n": name},
+		})
+		require.NoError(t, err)
+	}
+
+	// Emit one that "order.*" must NOT match (multi-segment).
+	err = app.EventBus().Emit(ctx, async.DomainEvent[any]{
+		Name:    "order.v2.created",
+		EventID: "order-v2-id",
+		Data:    map[string]any{},
+	})
+	require.NoError(t, err)
+
+	assert.Eventually(t, func() bool { return matched.Load() >= 2 }, 10*time.Second, 100*time.Millisecond,
+		"wildcard handler did not receive both matching events")
+
+	// Drain to confirm names came through correctly.
+	close(matchedNames)
+	seen := map[string]bool{}
+	for n := range matchedNames {
+		seen[n] = true
+	}
+	assert.True(t, seen["order.created"], "order.created should reach order.* handler")
+	assert.True(t, seen["order.cancelled"], "order.cancelled should reach order.* handler")
+	assert.False(t, seen["order.v2.created"], "order.* must not match multi-segment names")
+
+	assert.Equal(t, int32(0), unmatched.Load(), "invoice.# handler must not fire for order.* events")
+}

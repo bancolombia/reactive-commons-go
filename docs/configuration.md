@@ -71,13 +71,20 @@ zero-configuration interoperability with `reactive-commons-java`.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `WithDLQRetry` | `bool` | `false` | Declare DLQ exchange and queue for events and commands. Failed messages are routed there after all retries are exhausted. |
-| `RetryDelay` | `time.Duration` | `1s` | Message TTL in the DLQ before being re-routed (requires `WithDLQRetry: true`). |
+| `WithDLQRetry` | `bool` | `false` | Declare delayed-retry DLQ topology for events, commands and queries. Matches reactive-commons-java's behaviour. |
+| `RetryDelay` | `time.Duration` | `1s` | DLQ message TTL before redelivery (requires `WithDLQRetry: true`). |
 
-When `WithDLQRetry` is enabled:
-- `domainEvents.DLQ` exchange (direct) and `{appName}.subsEvents.DLQ` queue are declared.
-- `directMessages.DLQ` exchange (direct) and `{appName}.DLQ` queue are declared.
-- Events/commands that are nacked exhaust requeue attempts and land in the DLQ.
+When `WithDLQRetry` is enabled the topology mirrors reactive-commons-java:
+
+- Events: `{appName}.{domainEventsExchange}` (topic, retry exchange),
+  `{appName}.{domainEventsExchange}.DLQ` (topic, DLQ exchange) and
+  `{appName}.subsEvents.DLQ` (DLQ queue with `x-message-ttl`).
+- Commands and queries: `{directMessagesExchange}.DLQ` (direct, shared DLQ
+  exchange), plus per-queue DLQ queues `{appName}.DLQ` and `{appName}.query.DLQ`
+  with `x-message-ttl` that dead-letter back to `directMessages`.
+- Listeners nack failed deliveries with `requeue=false`, so the broker dead-
+  letters them through the DLQ. Without `WithDLQRetry` the listeners requeue
+  immediately (infinite retry — only suitable for development).
 
 ### Observability
 

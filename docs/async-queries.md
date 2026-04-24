@@ -12,7 +12,7 @@ achieved by a per-request correlation ID and a temporary reply queue.
 | Request exchange | `directMessages` (direct, durable) |
 | Request routing key | `{targetService}.query` |
 | Request queue | `{targetService}.query` (durable) |
-| Reply exchange | `globalReply` (direct, non-durable) |
+| Reply exchange | `globalReply` (topic, durable — matches reactive-commons-java) |
 | Reply routing key | `{caller}.replies.{uuid}` (unique per app instance) |
 | Reply queue | `{caller}.replies.{uuid}` (temp, auto-delete, exclusive) |
 | Default timeout | 15 seconds (configurable via `RabbitConfig.ReplyTimeout`) |
@@ -125,6 +125,25 @@ app.Registry().ServeQuery("get-product",
 
 > Returning `(nil, nil)` suppresses the automatic reply. Use this only when you intend to
 > call `Reply` manually. Failing to reply will cause the caller to time out.
+
+---
+
+## Wildcards Are Not Supported
+
+Unlike events, commands, and notifications, query handler names **must be
+exact strings**. Calling `ServeQuery` with a name containing `*` or `#`
+returns `async.ErrWildcardNotSupported`:
+
+```go
+err := app.Registry().ServeQuery("get-product.*", handler)
+// errors.Is(err, async.ErrWildcardNotSupported) == true
+```
+
+This matches `reactive-commons-java`'s `HandlerResolver.addQueryHandler`
+guard. Queries route through the **direct** exchange (routing key
+`{targetService}.query`), so topic-style patterns can't be expressed at the
+broker level and would create cache-conflict ambiguities. Use distinct
+resource names per query instead.
 
 ---
 

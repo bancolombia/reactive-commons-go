@@ -283,7 +283,8 @@ func TestQueries_HandlerError_ReturnedToCaller(t *testing.T) {
 }
 
 // TestEvents_WithDLQRetry_TopologyDeclared: when WithDLQRetry is true, the app
-// should start successfully (exercises topology.DeclareDLQ via wire-up in rabbit/builder).
+// should start successfully (exercises Topology.DeclareEventsDLQRetry and
+// DeclareDirectDLQRetry via wire-up in rabbit/builder).
 func TestEvents_WithDLQRetry_TopologyDeclared(t *testing.T) {
 	cfg := rabbit.NewConfigWithDefaults()
 	cfg.AppName = fmt.Sprintf("test-dlq-%d", time.Now().UnixNano())

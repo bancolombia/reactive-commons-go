@@ -129,29 +129,31 @@ cfg.RetryDelay   = 5 * time.Second
 
 ### What Gets Declared
 
-When `WithDLQRetry: true`:
+When `WithDLQRetry: true`, the topology mirrors reactive-commons-java:
 
-| Declared resource | Used for |
-|-------------------|---------|
-| `domainEvents.DLQ` (direct exchange) | Dead-lettered events |
-| `{appName}.subsEvents.DLQ` (queue) | Failed event messages |
-| `directMessages.DLQ` (direct exchange) | Dead-lettered commands |
-| `{appName}.DLQ` (queue) | Failed command messages |
+| Declared resource | Type | Used for |
+|-------------------|------|----------|
+| `{appName}.{domainEvents}` | topic exchange | Per-app retry exchange for events |
+| `{appName}.{domainEvents}.DLQ` | topic exchange | Per-app DLQ exchange for events |
+| `{appName}.subsEvents.DLQ` | durable queue | Failed events; `x-message-ttl=RetryDelay`, dead-letters back to the retry exchange |
+| `{directMessages}.DLQ` | direct exchange | Shared DLQ exchange for commands and queries |
+| `{appName}.DLQ` | durable queue | Failed commands; TTL → re-publishes to `directMessages` with the original routing key |
+| `{appName}.query.DLQ` | durable queue | Failed queries; same TTL pattern as commands |
 
-Events and commands queues are declared with:
-- `x-dead-letter-exchange`: pointing to the DLQ exchange
-- `x-message-ttl`: set to `RetryDelay` in milliseconds
+Origin queues (events, commands, queries) are declared with
+`x-dead-letter-exchange` pointing at their DLQ exchange.
 
-### DLQ Flow
+### DLQ Flow (Java-equivalent retry loop)
 
-```
-Handler returns error → nack → broker requeues → (after RetryDelay) → moves to DLQ queue
-```
+1. Handler returns an error → listener nacks with `requeue=false`.
+2. Broker dead-letters the message to the configured DLQ exchange.
+3. The DLQ queue holds it for `RetryDelay` ms (per-message TTL).
+4. TTL expires → broker dead-letters it to the retry/origin exchange, which
+   routes it back to the original queue for another attempt.
 
-From the DLQ queue, messages can be:
-- Inspected via the RabbitMQ Management UI
-- Replayed by moving them back to the primary queue
-- Consumed by a dedicated DLQ processor service
+This delays redelivery instead of looping immediately. Without `WithDLQRetry`,
+the listeners requeue failed messages immediately (suitable only for
+development).
 
 ---
 

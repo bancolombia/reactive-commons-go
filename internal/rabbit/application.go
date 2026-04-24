@@ -152,6 +152,11 @@ func (a *RabbitApp) startQueryConsumer(ctx context.Context, conn *Connection, to
 	if err != nil {
 		return err
 	}
+	if a.cfg.WithDLQRetry {
+		if err = topo.DeclareDirectDLQRetry(qName, qName); err != nil {
+			return err
+		}
+	}
 	if err = topo.BindQueue(qName, a.cfg.DirectMessagesExchange, qName); err != nil {
 		return err
 	}
@@ -168,7 +173,7 @@ func (a *RabbitApp) startCommandConsumer(ctx context.Context, conn *Connection, 
 		return err
 	}
 	if a.cfg.WithDLQRetry {
-		if err = topo.DeclareDLQ(qName, a.cfg.DirectMessagesExchange); err != nil {
+		if err = topo.DeclareDirectDLQRetry(qName, a.cfg.AppName); err != nil {
 			return err
 		}
 	}
@@ -213,7 +218,7 @@ func (a *RabbitApp) startEventConsumer(ctx context.Context, conn *Connection, to
 		return err
 	}
 	if a.cfg.WithDLQRetry {
-		if err = topo.DeclareDLQ(qName, a.cfg.DomainEventsExchange); err != nil {
+		if err = topo.DeclareEventsDLQRetry(qName); err != nil {
 			return err
 		}
 	}

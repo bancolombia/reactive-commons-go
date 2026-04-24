@@ -63,10 +63,12 @@ func (l *commandListener) Start(ctx context.Context, queueName string) error {
 }
 
 func (l *commandListener) dispatch(ctx context.Context, d amqp.Delivery) {
+	requeueOnFailure := !l.cfg.WithDLQRetry
+
 	defer func() {
 		if r := recover(); r != nil {
 			l.log.Error("reactive-commons: panic in command handler", "panic", r)
-			_ = d.Nack(false, true)
+			_ = d.Nack(false, requeueOnFailure)
 		}
 	}()
 
@@ -79,7 +81,6 @@ func (l *commandListener) dispatch(ctx context.Context, d amqp.Delivery) {
 
 	handler := l.reg.CommandHandler(env.Name)
 	if handler == nil {
-		// No handler registered — silently ack and discard.
 		_ = d.Ack(false)
 		return
 	}
@@ -92,7 +93,7 @@ func (l *commandListener) dispatch(ctx context.Context, d amqp.Delivery) {
 
 	if err := handler(ctx, cmd); err != nil {
 		l.log.Error("reactive-commons: command handler error", "command", env.Name, "error", err)
-		_ = d.Nack(false, true)
+		_ = d.Nack(false, requeueOnFailure)
 		return
 	}
 	_ = d.Ack(false)
