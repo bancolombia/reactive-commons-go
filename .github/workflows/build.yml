@@ -72,8 +72,20 @@ jobs:
         run: |
           go vet ./...
 
-      - name: Test and generate coverage
-        run: go test -race -covermode=atomic -coverprofile=coverage.out ./...
+      - name: Unit tests with coverage
+        run: |
+          PKGS=$(go list ./... | grep -v '/examples/' | paste -sd, -)
+          go test -race -covermode=atomic -coverpkg=$PKGS -coverprofile=coverage.unit.out ./...
+
+      - name: Integration tests with coverage
+        run: |
+          PKGS=$(go list ./... | grep -v '/examples/' | paste -sd, -)
+          go test -tags integration -covermode=atomic -coverpkg=$PKGS -coverprofile=coverage.integration.out ./tests/integration/... -timeout 180s
+
+      - name: Merge coverage profiles
+        run: |
+          go install github.com/wadey/gocovmerge@latest
+          "$(go env GOPATH)/bin/gocovmerge" coverage.unit.out coverage.integration.out > coverage.out
 
 #      - name: Upload coverage to Codecov
 #        uses: codecov/codecov-action@v5
@@ -91,8 +103,8 @@ jobs:
             -Dsonar.projectKey=bancolombia_reactive-commons-go
             -Dsonar.organization=grupo-bancolombia
             -Dsonar.sources=.
-            -Dsonar.coverage.exclusions=**/*_test.go,**/examples/*.go
-            -Dsonar.exclusions=**/*_test.go,**/examples/*.go
+            -Dsonar.coverage.exclusions=**/*_test.go,**/examples/**
+            -Dsonar.exclusions=**/*_test.go,**/examples/**
             -Dsonar.tests=.
             -Dsonar.test.inclusions=**/*_test.go
             -Dsonar.go.coverage.reportPaths=coverage.out

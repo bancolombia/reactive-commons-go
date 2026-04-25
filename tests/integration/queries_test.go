@@ -310,3 +310,38 @@ func TestEvents_WithDLQRetry_TopologyDeclared(t *testing.T) {
 		t.Fatal("app with DLQ config did not become ready in time")
 	}
 }
+
+// TestCommandsAndQueries_WithDLQRetry_TopologyDeclared: when WithDLQRetry is
+// true and the app has a command and query handler, both DeclareDirectDLQRetry
+// branches (commands and queries) must run during Start without error.
+func TestCommandsAndQueries_WithDLQRetry_TopologyDeclared(t *testing.T) {
+	cfg := rabbit.NewConfigWithDefaults()
+	cfg.AppName = fmt.Sprintf("test-dlq-cq-%d", time.Now().UnixNano())
+	cfg.Host = rabbitHost
+	cfg.Port = rabbitPort
+	cfg.WithDLQRetry = true
+
+	app, err := rabbit.NewApplication(cfg)
+	require.NoError(t, err)
+
+	require.NoError(t, app.Registry().ListenCommand("dlq-cmd", func(ctx context.Context, c async.Command[any]) error {
+		return nil
+	}))
+	require.NoError(t, app.Registry().ServeQuery("dlq-query", func(ctx context.Context, q async.AsyncQuery[any], from async.From) (any, error) {
+		return nil, nil
+	}))
+	require.NoError(t, app.Registry().ListenNotification("dlq.notif", func(ctx context.Context, n async.Notification[any]) error {
+		return nil
+	}))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() { _ = app.Start(ctx) }()
+
+	select {
+	case <-app.Ready():
+		// commands + queries DLQ topology declared successfully
+	case <-time.After(30 * time.Second):
+		t.Fatal("app with command/query DLQ config did not become ready in time")
+	}
+}

@@ -101,3 +101,96 @@ func TestReadDomainEvent_InvalidJSON(t *testing.T) {
 	_, err := rabbit.ReadDomainEvent[orderPayload]([]byte(`not-json`))
 	assert.ErrorIs(t, err, async.ErrDeserialize)
 }
+
+func TestReadDomainEvent_NullData_ZeroValue(t *testing.T) {
+	event, err := rabbit.ReadDomainEvent[orderPayload]([]byte(`{"name":"x","eventId":"1","data":null}`))
+	require.NoError(t, err)
+	assert.Equal(t, "x", event.Name)
+	assert.Equal(t, orderPayload{}, event.Data)
+}
+
+func TestReadDomainEvent_EmptyData_ZeroValue(t *testing.T) {
+	event, err := rabbit.ReadDomainEvent[orderPayload]([]byte(`{"name":"x","eventId":"1"}`))
+	require.NoError(t, err)
+	assert.Equal(t, "x", event.Name)
+	assert.Equal(t, orderPayload{}, event.Data)
+}
+
+func TestReadDomainEvent_BadInnerJSON(t *testing.T) {
+	// data is the wrong shape for orderPayload (Amount expects int).
+	body := []byte(`{"name":"x","eventId":"1","data":{"amount":"not-a-number"}}`)
+	_, err := rabbit.ReadDomainEvent[orderPayload](body)
+	assert.ErrorIs(t, err, async.ErrDeserialize)
+}
+
+func TestReadCommand_InvalidJSON(t *testing.T) {
+	_, err := rabbit.ReadCommand[invoicePayload]([]byte(`not-json`))
+	assert.ErrorIs(t, err, async.ErrDeserialize)
+}
+
+func TestReadCommand_NullData_ZeroValue(t *testing.T) {
+	cmd, err := rabbit.ReadCommand[invoicePayload]([]byte(`{"name":"x","commandId":"1","data":null}`))
+	require.NoError(t, err)
+	assert.Equal(t, invoicePayload{}, cmd.Data)
+}
+
+func TestReadCommand_BadInnerJSON(t *testing.T) {
+	body := []byte(`{"name":"x","commandId":"1","data":"not-an-object"}`)
+	_, err := rabbit.ReadCommand[invoicePayload](body)
+	assert.ErrorIs(t, err, async.ErrDeserialize)
+}
+
+func TestReadQuery_InvalidJSON(t *testing.T) {
+	_, err := rabbit.ReadQuery[productQuery]([]byte(`not-json`))
+	assert.ErrorIs(t, err, async.ErrDeserialize)
+}
+
+func TestReadQuery_NullData_ZeroValue(t *testing.T) {
+	q, err := rabbit.ReadQuery[productQuery]([]byte(`{"resource":"r","queryData":null}`))
+	require.NoError(t, err)
+	assert.Equal(t, productQuery{}, q.QueryData)
+}
+
+func TestReadQuery_BadInnerJSON(t *testing.T) {
+	body := []byte(`{"resource":"r","queryData":"oops"}`)
+	_, err := rabbit.ReadQuery[productQuery](body)
+	assert.ErrorIs(t, err, async.ErrDeserialize)
+}
+
+func TestReadNotification_InvalidJSON(t *testing.T) {
+	type cachePayload struct {
+		Region string `json:"region"`
+	}
+	_, err := rabbit.ReadNotification[cachePayload]([]byte(`not-json`))
+	assert.ErrorIs(t, err, async.ErrDeserialize)
+}
+
+func TestReadNotification_NullData_ZeroValue(t *testing.T) {
+	type cachePayload struct {
+		Region string `json:"region"`
+	}
+	n, err := rabbit.ReadNotification[cachePayload]([]byte(`{"name":"n","eventId":"1","data":null}`))
+	require.NoError(t, err)
+	assert.Equal(t, cachePayload{}, n.Data)
+}
+
+func TestReadNotification_BadInnerJSON(t *testing.T) {
+	type cachePayload struct {
+		Region string `json:"region"`
+	}
+	body := []byte(`{"name":"n","eventId":"1","data":42}`)
+	_, err := rabbit.ReadNotification[cachePayload](body)
+	assert.ErrorIs(t, err, async.ErrDeserialize)
+}
+
+// ToMessage wraps json.Marshal errors with ErrDeserialize. Channels are
+// not JSON-marshalable, so they trigger the error branch.
+func TestToMessage_MarshalError_ReturnsErrDeserialize(t *testing.T) {
+	bad := async.DomainEvent[any]{
+		Name:    "x",
+		EventID: "1",
+		Data:    make(chan int),
+	}
+	_, err := rabbit.ToMessage(bad)
+	assert.ErrorIs(t, err, async.ErrDeserialize)
+}
