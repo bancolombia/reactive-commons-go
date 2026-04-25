@@ -7,6 +7,10 @@ import (
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
+// argDeadLetterExchange is the AMQP queue argument that routes dead-lettered
+// messages to the named exchange. See RabbitMQ's DLX documentation.
+const argDeadLetterExchange = "x-dead-letter-exchange"
+
 // Topology declares all AMQP exchanges and queues required by reactive-commons.
 type Topology struct {
 	cfg Config
@@ -68,7 +72,7 @@ func (t *Topology) DeclareEventsQueue() (string, error) {
 	name := t.cfg.AppName + ".subsEvents"
 	var args amqp.Table
 	if t.cfg.WithDLQRetry {
-		args = amqp.Table{"x-dead-letter-exchange": t.EventsDLQExchange()}
+		args = amqp.Table{argDeadLetterExchange: t.EventsDLQExchange()}
 	}
 	_, err := t.ch.QueueDeclare(name, true, false, false, false, args)
 	return name, wrapQueueErr(name, err)
@@ -80,7 +84,7 @@ func (t *Topology) DeclareCommandsQueue() (string, error) {
 	name := t.cfg.AppName
 	var args amqp.Table
 	if t.cfg.WithDLQRetry {
-		args = amqp.Table{"x-dead-letter-exchange": t.DirectDLQExchange()}
+		args = amqp.Table{argDeadLetterExchange: t.DirectDLQExchange()}
 	}
 	_, err := t.ch.QueueDeclare(name, true, false, false, false, args)
 	return name, wrapQueueErr(name, err)
@@ -92,7 +96,7 @@ func (t *Topology) DeclareQueriesQueue() (string, error) {
 	name := t.cfg.AppName + ".query"
 	var args amqp.Table
 	if t.cfg.WithDLQRetry {
-		args = amqp.Table{"x-dead-letter-exchange": t.DirectDLQExchange()}
+		args = amqp.Table{argDeadLetterExchange: t.DirectDLQExchange()}
 	}
 	_, err := t.ch.QueueDeclare(name, true, false, false, false, args)
 	return name, wrapQueueErr(name, err)
@@ -128,8 +132,8 @@ func (t *Topology) DeclareEventsDLQRetry(eventsQueue string) error {
 	}
 
 	dlqArgs := amqp.Table{
-		"x-dead-letter-exchange": retryExchange,
-		"x-message-ttl":          int32(t.cfg.RetryDelay / time.Millisecond),
+		argDeadLetterExchange: retryExchange,
+		"x-message-ttl":       int32(t.cfg.RetryDelay / time.Millisecond),
 	}
 	if _, err := t.ch.QueueDeclare(dlqQueue, true, false, false, false, dlqArgs); err != nil {
 		return fmt.Errorf("reactive-commons: declare events DLQ queue %q: %w", dlqQueue, err)
@@ -162,8 +166,8 @@ func (t *Topology) DeclareDirectDLQRetry(originQueue, routingKey string) error {
 	}
 
 	dlqArgs := amqp.Table{
-		"x-dead-letter-exchange": t.cfg.DirectMessagesExchange,
-		"x-message-ttl":          int32(t.cfg.RetryDelay / time.Millisecond),
+		argDeadLetterExchange: t.cfg.DirectMessagesExchange,
+		"x-message-ttl":       int32(t.cfg.RetryDelay / time.Millisecond),
 	}
 	if _, err := t.ch.QueueDeclare(dlqQueue, true, false, false, false, dlqArgs); err != nil {
 		return fmt.Errorf("reactive-commons: declare direct DLQ queue %q: %w", dlqQueue, err)

@@ -22,7 +22,7 @@ jobs:
       - name: Generate a token
         id: generate_token
         if: github.ref == 'refs/heads/main'
-        uses: tibdex/github-app-token@v2
+        uses: tibdex/github-app-token@3beb63f4bd073e61482598c45c71c1019b59b73a # v2
         with:
           app_id: ${{ secrets.APP_ID_ADMIN_GITHUB }}
           private_key: ${{ secrets.APP_PRIVATE_KEY_ADMIN_GITHUB }}
@@ -35,7 +35,7 @@ jobs:
         if: github.ref != 'refs/heads/main'
 
       - name: Verify Conventional Commits
-        uses: amannn/action-semantic-pull-request@v5
+        uses: amannn/action-semantic-pull-request@e32d7e603df1aa1ba07e981f2a23455dee596825 # v5
         if: github.event_name == 'pull_request' || github.event_name == 'pull_request_target'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -48,7 +48,7 @@ jobs:
 
       - name: Set up Semantic Release
         if: github.ref == 'refs/heads/main'
-        run: npm -g install @semantic-release/git semantic-release@23.0.0
+        run: npm -g install --ignore-scripts @semantic-release/git semantic-release@23.0.0
 
       - name: Semantic Release
         if: github.ref == 'refs/heads/main'
@@ -94,7 +94,7 @@ jobs:
 #          files: ./coverage.out
 
       - name: Analyze with SonarQube
-        uses: SonarSource/sonarqube-scan-action@v6 # Use the official action
+        uses: SonarSource/sonarqube-scan-action@fd88b7d7ccbaefd23d8f36f73b59db7a3d246602 # v6
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
         with:

@@ -49,7 +49,7 @@ func (cfg RabbitConfig) WithDefaults() RabbitConfig {
 		cfg.Username = "guest"
 	}
 	if cfg.Password == "" {
-		cfg.Password = "guest"
+		cfg.Password = "guest" //NOSONAR go:S2068 - default RabbitMQ dev credential, not a real secret
 	}
 	if cfg.VirtualHost == "" {
 		cfg.VirtualHost = "/"
