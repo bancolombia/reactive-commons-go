@@ -61,6 +61,7 @@ func toInternalConfig(cfg RabbitConfig) irabbit.Config {
 		PersistentQueries:      cfg.PersistentQueries,
 		WithDLQRetry:           cfg.WithDLQRetry,
 		RetryDelay:             cfg.RetryDelay,
+		QueueType:              cfg.QueueType,
 		Logger:                 log,
 	}
 }

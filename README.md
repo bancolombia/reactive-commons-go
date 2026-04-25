@@ -221,6 +221,9 @@ rabbit.RabbitConfig{
     PersistentCommands: true,
     PersistentQueries:  false,
 
+    // Queue type for durable consumer queues — "classic" or "quorum"
+    QueueType: "classic",
+
     // Dead-letter queue retry (optional)
     WithDLQRetry: false,
     RetryDelay:   1 * time.Second,

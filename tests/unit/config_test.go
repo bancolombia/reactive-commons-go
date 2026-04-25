@@ -24,6 +24,7 @@ func TestRabbitConfig_WithDefaults_FillsAllZeroFields(t *testing.T) {
 	assert.Equal(t, 250, cfg.PrefetchCount)
 	assert.Equal(t, 15*time.Second, cfg.ReplyTimeout)
 	assert.Equal(t, 1*time.Second, cfg.RetryDelay)
+	assert.Equal(t, "classic", cfg.QueueType)
 	assert.NotNil(t, cfg.Logger)
 }
 
@@ -43,6 +44,7 @@ func TestRabbitConfig_WithDefaults_PreservesExplicitValues(t *testing.T) {
 		ReplyTimeout:           5 * time.Second,
 		WithDLQRetry:           true,
 		RetryDelay:             3 * time.Second,
+		QueueType:              "quorum",
 		Logger:                 custom,
 	}.WithDefaults()
 
@@ -58,6 +60,7 @@ func TestRabbitConfig_WithDefaults_PreservesExplicitValues(t *testing.T) {
 	assert.Equal(t, 5*time.Second, cfg.ReplyTimeout)
 	assert.True(t, cfg.WithDLQRetry)
 	assert.Equal(t, 3*time.Second, cfg.RetryDelay)
+	assert.Equal(t, "quorum", cfg.QueueType)
 	assert.Same(t, custom, cfg.Logger)
 }
 
@@ -82,6 +85,7 @@ func TestRabbitConfig_NewConfigWithDefaults_ReturnsCompleteDefaults(t *testing.T
 	assert.True(t, cfg.PersistentCommands)
 	assert.False(t, cfg.PersistentQueries)
 	assert.False(t, cfg.WithDLQRetry)
+	assert.Equal(t, "classic", cfg.QueueType)
 	assert.NotNil(t, cfg.Logger)
 }
 
@@ -94,4 +98,23 @@ func TestRabbitConfig_Validate(t *testing.T) {
 	err := cfg.Validate()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "AppName is required")
+}
+
+func TestRabbitConfig_Validate_RejectsUnknownQueueType(t *testing.T) {
+	cfg := rabbit.NewConfigWithDefaults()
+	cfg.AppName = "svc"
+	cfg.QueueType = "weird"
+
+	err := cfg.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "QueueType must be")
+}
+
+func TestRabbitConfig_Validate_AcceptsKnownQueueTypes(t *testing.T) {
+	for _, qt := range []string{"", "classic", "quorum"} {
+		cfg := rabbit.NewConfigWithDefaults()
+		cfg.AppName = "svc"
+		cfg.QueueType = qt
+		assert.NoError(t, cfg.Validate(), "QueueType=%q should be valid", qt)
+	}
 }

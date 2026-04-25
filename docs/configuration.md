@@ -66,6 +66,21 @@ zero-configuration interoperability with `reactive-commons-java`.
 | `PersistentEvents` | `bool` | `true` | Publish domain events with delivery-mode 2 (persistent). Survives broker restart. |
 | `PersistentCommands` | `bool` | `true` | Publish commands with delivery-mode 2 (persistent). |
 | `PersistentQueries` | `bool` | `false` | Publish query requests with delivery-mode 2. Usually transient is fine. |
+| `QueueType` | `string` | `"classic"` | RabbitMQ queue type for durable consumer queues and their DLQs. Allowed values: `"classic"` or `"quorum"`. Mirrors reactive-commons-java's `app.async.app.queueType`. |
+
+#### Queue Type Notes
+
+`QueueType` only affects durable consumer and DLQ queues
+(`{appName}.subsEvents`, `{appName}`, `{appName}.query`, and their `.DLQ`
+siblings when `WithDLQRetry` is enabled). Temporary queues — the per-instance
+reply queue and the notification fan-out queue — are always classic, because
+they are declared exclusive auto-delete and quorum queues do not support those
+flags.
+
+`x-queue-type` is recorded on the queue at declaration time and is immutable
+for the queue's lifetime. If a queue with the same name already exists with a
+different type, the broker rejects redeclaration with `PRECONDITION_FAILED`
+(code 406). To switch types, delete the existing queue first.
 
 ### Dead-Letter Queue (DLQ) Retry
 
@@ -204,6 +219,7 @@ func buildConfig() rabbit.RabbitConfig {
         PersistentEvents:   true,
         PersistentCommands: true,
         PersistentQueries:  false,
+        QueueType:          "classic", // or "quorum" for HA in clusters
 
         // DLQ
         WithDLQRetry: true,

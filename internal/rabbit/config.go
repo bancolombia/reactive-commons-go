@@ -27,5 +27,9 @@ type Config struct {
 	WithDLQRetry       bool
 	RetryDelay         time.Duration
 
+	// QueueType is the RabbitMQ queue type ("classic" or "quorum") used for
+	// durable consumer queues and their DLQs. Empty means classic.
+	QueueType string
+
 	Logger *slog.Logger
 }

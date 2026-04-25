@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/bancolombia/reactive-commons-go/internal/rabbit"
+	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -30,4 +31,40 @@ func TestTopology_DLQNamesMatchJava(t *testing.T) {
 		"events DLQ exchange must be {appName}.{eventsExchange}.DLQ (Java parity)")
 	assert.Equal(t, "directMessages.DLQ", topo.DirectDLQExchange(),
 		"direct DLQ exchange must be {directExchange}.DLQ (Java parity)")
+}
+
+// QueueArgs must include x-queue-type whenever QueueType is set, must merge
+// caller-supplied entries on top, and must return nil when there is nothing
+// to declare (empty type and no extras).
+func TestTopology_QueueArgs(t *testing.T) {
+	t.Run("returns nil when no type and no extras", func(t *testing.T) {
+		topo := rabbit.NewTopology(rabbit.Config{}, nil)
+		assert.Nil(t, topo.QueueArgs(nil))
+	})
+
+	t.Run("includes x-queue-type alone when no extras", func(t *testing.T) {
+		topo := rabbit.NewTopology(rabbit.Config{QueueType: "quorum"}, nil)
+		args := topo.QueueArgs(nil)
+		assert.Equal(t, "quorum", args["x-queue-type"])
+		assert.Len(t, args, 1)
+	})
+
+	t.Run("merges extras with x-queue-type", func(t *testing.T) {
+		topo := rabbit.NewTopology(rabbit.Config{QueueType: "quorum"}, nil)
+		args := topo.QueueArgs(amqp.Table{
+			"x-dead-letter-exchange": "foo.DLQ",
+			"x-message-ttl":          int32(1000),
+		})
+		assert.Equal(t, "quorum", args["x-queue-type"])
+		assert.Equal(t, "foo.DLQ", args["x-dead-letter-exchange"])
+		assert.Equal(t, int32(1000), args["x-message-ttl"])
+	})
+
+	t.Run("returns extras unchanged when no type", func(t *testing.T) {
+		topo := rabbit.NewTopology(rabbit.Config{}, nil)
+		args := topo.QueueArgs(amqp.Table{"x-dead-letter-exchange": "foo.DLQ"})
+		assert.Equal(t, "foo.DLQ", args["x-dead-letter-exchange"])
+		_, hasType := args["x-queue-type"]
+		assert.False(t, hasType)
+	})
 }
