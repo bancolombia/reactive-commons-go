@@ -185,22 +185,27 @@ func (c *Connection) Close() error {
 }
 
 // watchClose monitors the connection and reconnects with exponential backoff.
+// Single-shot: this goroutine watches exactly one connection and exits after
+// either an intentional close or after handing off to reconnectLoop. The
+// reconnectLoop spawns a fresh watchClose for the new connection, which keeps
+// exactly one watcher alive at a time. Looping here would double the watcher
+// count on every reconnect (the original goroutine would race with the one
+// spawned by reconnectLoop), causing duplicate AMQP connections and N-way
+// concurrent hook execution on the next disconnect.
 func (c *Connection) watchClose(url string) {
-	for {
-		c.mu.RLock()
-		conn := c.conn
-		c.mu.RUnlock()
-		if conn == nil {
-			return
-		}
-		closedErr := <-conn.NotifyClose(make(chan *amqp.Error, 1))
-		if closedErr == nil {
-			// Intentional close — do not reconnect.
-			return
-		}
-		c.log.Error("reactive-commons: broker connection lost", "error", closedErr)
-		c.reconnectLoop(url)
+	c.mu.RLock()
+	conn := c.conn
+	c.mu.RUnlock()
+	if conn == nil {
+		return
 	}
+	closedErr := <-conn.NotifyClose(make(chan *amqp.Error, 1))
+	if closedErr == nil {
+		// Intentional close — do not reconnect.
+		return
+	}
+	c.log.Error("reactive-commons: broker connection lost", "error", closedErr)
+	c.reconnectLoop(url)
 }
 
 func (c *Connection) reconnectLoop(url string) {
