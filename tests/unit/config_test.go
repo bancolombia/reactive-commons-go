@@ -25,7 +25,17 @@ func TestRabbitConfig_WithDefaults_FillsAllZeroFields(t *testing.T) {
 	assert.Equal(t, 15*time.Second, cfg.ReplyTimeout)
 	assert.Equal(t, 1*time.Second, cfg.RetryDelay)
 	assert.Equal(t, "classic", cfg.QueueType)
+	assert.Equal(t, "svc", cfg.ConnectionName)
 	assert.NotNil(t, cfg.Logger)
+}
+
+func TestRabbitConfig_WithDefaults_PreservesExplicitConnectionName(t *testing.T) {
+	cfg := rabbit.RabbitConfig{
+		AppName:        "svc",
+		ConnectionName: "svc-pod-7",
+	}.WithDefaults()
+
+	assert.Equal(t, "svc-pod-7", cfg.ConnectionName)
 }
 
 func TestRabbitConfig_WithDefaults_PreservesExplicitValues(t *testing.T) {

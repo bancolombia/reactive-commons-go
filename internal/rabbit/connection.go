@@ -4,6 +4,9 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
+	"runtime"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -12,6 +15,67 @@ import (
 )
 
 const publisherPoolSize = 4
+
+// modulePath is the Go module path used to look up the library's own version
+// from the consumer binary's build info.
+const modulePath = "github.com/bancolombia/reactive-commons-go"
+
+// libVersion is the reactive-commons-go module version advertised in AMQP
+// client-properties. Resolved once at init via runtime/debug.ReadBuildInfo so
+// downstream binaries automatically expose the exact tag/pseudo-version they
+// imported, without requiring -ldflags.
+var libVersion = resolveLibVersion()
+
+// resolveLibVersion walks the build info of the running binary to find this
+// module's version. It returns:
+//   - the dependency version when the library is imported (e.g. "v1.2.3" or
+//     a "v0.0.0-YYYYMMDDHHMMSS-<sha>" pseudo-version);
+//   - the main-module version when the library itself is built directly
+//     (tests, examples);
+//   - "devel" when running from a working copy without a tagged build;
+//   - "unknown" if build info is unavailable.
+func resolveLibVersion() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "unknown"
+	}
+	if info.Main.Path == modulePath {
+		if v := info.Main.Version; v != "" && v != "(devel)" {
+			return v
+		}
+		return "devel"
+	}
+	for _, dep := range info.Deps {
+		if dep != nil && dep.Path == modulePath {
+			if dep.Replace != nil && dep.Replace.Version != "" {
+				return dep.Replace.Version
+			}
+			if dep.Version != "" {
+				return dep.Version
+			}
+		}
+	}
+	return "unknown"
+}
+
+// clientProperties builds the AMQP client-properties table advertised during the
+// connection handshake. RabbitMQ Management UI surfaces these (notably
+// `connection_name`) in the Connections tab.
+func clientProperties(cfg Config) amqp.Table {
+	name := cfg.ConnectionName
+	if name == "" {
+		name = cfg.AppName
+	}
+	host, _ := os.Hostname()
+	return amqp.Table{
+		"connection_name": name,
+		"product":         "reactive-commons-go",
+		"platform":        "Go " + runtime.Version(),
+		"version":         libVersion,
+		"information":     "https://github.com/bancolombia/reactive-commons-go",
+		"host":            host,
+	}
+}
 
 // Connection manages a single AMQP connection and a pool of publisher channels.
 type Connection struct {
@@ -39,7 +103,12 @@ func (c *Connection) Dial() error {
 	url := fmt.Sprintf("amqp://%s:%s@%s:%d%s",
 		c.cfg.Username, c.cfg.Password, c.cfg.Host, c.cfg.Port, c.cfg.VHost)
 
-	conn, err := amqp.Dial(url)
+	conn, err := amqp.DialConfig(url, amqp.Config{
+		Vhost:      c.cfg.VHost,
+		Properties: clientProperties(c.cfg),
+		Heartbeat:  10 * time.Second,
+		Locale:     "en_US",
+	})
 	if err != nil {
 		return fmt.Errorf("reactive-commons: dial %s:%d: %w", c.cfg.Host, c.cfg.Port, err)
 	}
@@ -141,7 +210,12 @@ func (c *Connection) reconnectLoop(url string) {
 		c.log.Info("reactive-commons: attempting reconnect", "delay", backoff)
 		time.Sleep(backoff)
 
-		conn, err := amqp.Dial(url)
+		conn, err := amqp.DialConfig(url, amqp.Config{
+			Vhost:      c.cfg.VHost,
+			Properties: clientProperties(c.cfg),
+			Heartbeat:  10 * time.Second,
+			Locale:     "en_US",
+		})
 		if err != nil {
 			c.log.Warn("reactive-commons: reconnect failed", "error", err)
 			backoff = min(backoff*2, maxBackoff)

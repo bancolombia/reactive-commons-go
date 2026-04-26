@@ -43,8 +43,85 @@ app, err := rabbit.NewApplication(cfg)
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `AppName` | `string` | **required** | Service name. Used for queue naming (`{AppName}.subsEvents`, `{AppName}` commands queue, `{AppName}.query`, etc.) |
+| `ConnectionName` | `string` | `AppName` | Advertised to RabbitMQ as the AMQP `connection_name` client property. Shows up in the Management UI Connections tab and broker logs. Override per-instance (e.g. `{AppName}-{podName}`) to distinguish replicas. |
 
 `AppName` must be non-empty — `NewApplication` returns an error if it is missing.
+
+#### Setting `ConnectionName` per-pod on Kubernetes
+
+When you run multiple replicas, every pod will report the same `connection_name`
+(its `AppName`) on the broker — making it hard to tell replicas apart in the
+RabbitMQ Management UI. Use the [Kubernetes downward API](https://kubernetes.io/docs/concepts/workloads/pods/downward-api/)
+to expose the pod name as an env var, then read it from Go and stitch it into
+`ConnectionName`.
+
+**1. Expose pod metadata in your Deployment/StatefulSet:**
+
+```yaml
+spec:
+  template:
+    spec:
+      containers:
+        - name: my-service
+          env:
+            - name: APP_NAME
+              value: "my-service"
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+```
+
+`metadata.name` resolves to e.g. `my-service-7d9c8f6b4-xk2lp` (Deployment) or
+the stable `my-service-0` (StatefulSet).
+
+**2. Build `ConnectionName` from those env vars:**
+
+```go
+import (
+    "fmt"
+    "os"
+
+    "github.com/bancolombia/reactive-commons-go/rabbit"
+)
+
+func buildConnectionName(appName string) string {
+    if pod := os.Getenv("POD_NAME"); pod != "" {
+        return fmt.Sprintf("%s@%s", appName, pod)
+    }
+    if host, err := os.Hostname(); err == nil && host != "" {
+        return fmt.Sprintf("%s@%s", appName, host)
+    }
+    return appName
+}
+
+cfg := rabbit.NewConfigWithDefaults()
+cfg.AppName = os.Getenv("APP_NAME")
+cfg.ConnectionName = buildConnectionName(cfg.AppName)
+```
+
+The Management UI's Connections tab will then list each replica separately,
+e.g. `my-service@my-service-7d9c8f6b4-xk2lp`. Combine with `POD_NAMESPACE`
+when several namespaces share one RabbitMQ cluster:
+
+```go
+cfg.ConnectionName = fmt.Sprintf("%s/%s/%s",
+    cfg.AppName,
+    os.Getenv("POD_NAMESPACE"),
+    os.Getenv("POD_NAME"),
+)
+```
+
+**Note:** in Kubernetes the container's hostname already equals the pod name by
+default, so `os.Hostname()` works as a no-manifest fallback. The library
+automatically records `host` from `os.Hostname()` in the AMQP client-properties
+table regardless, but the explicit `POD_NAME` env var is the recommended
+contract for production manifests.
+
 
 ### Exchange Names
 

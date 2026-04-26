@@ -51,6 +51,7 @@ func toInternalConfig(cfg RabbitConfig) irabbit.Config {
 		Password:               cfg.Password,
 		VHost:                  cfg.VirtualHost,
 		AppName:                cfg.AppName,
+		ConnectionName:         cfg.ConnectionName,
 		DomainEventsExchange:   cfg.DomainEventsExchange,
 		DirectMessagesExchange: cfg.DirectMessagesExchange,
 		GlobalReplyExchange:    cfg.GlobalReplyExchange,

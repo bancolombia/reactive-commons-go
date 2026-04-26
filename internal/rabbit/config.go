@@ -15,6 +15,10 @@ type Config struct {
 	VHost    string
 	AppName  string
 
+	// ConnectionName advertised to RabbitMQ as the `connection_name` client
+	// property. Empty falls back to AppName at dial time.
+	ConnectionName string
+
 	DomainEventsExchange   string
 	DirectMessagesExchange string
 	GlobalReplyExchange    string

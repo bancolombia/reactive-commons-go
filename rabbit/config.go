@@ -20,6 +20,11 @@ type RabbitConfig struct {
 	// AppName is required. Used for queue naming (e.g. "{AppName}.subsEvents").
 	AppName string
 
+	// ConnectionName is advertised to RabbitMQ as the AMQP `connection_name`
+	// client property, making the connection identifiable in the Management UI
+	// and broker logs. Defaults to AppName when empty.
+	ConnectionName string
+
 	// Exchange names — defaults match reactive-commons-java
 	DomainEventsExchange   string // default: "domainEvents"
 	DirectMessagesExchange string // default: "directMessages"
@@ -85,6 +90,9 @@ func (cfg RabbitConfig) WithDefaults() RabbitConfig {
 	}
 	if cfg.QueueType == "" {
 		cfg.QueueType = "classic"
+	}
+	if cfg.ConnectionName == "" {
+		cfg.ConnectionName = cfg.AppName
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
