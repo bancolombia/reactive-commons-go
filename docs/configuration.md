@@ -43,8 +43,85 @@ app, err := rabbit.NewApplication(cfg)
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `AppName` | `string` | **required** | Service name. Used for queue naming (`{AppName}.subsEvents`, `{AppName}` commands queue, `{AppName}.query`, etc.) |
+| `ConnectionName` | `string` | `AppName` | Advertised to RabbitMQ as the AMQP `connection_name` client property. Shows up in the Management UI Connections tab and broker logs. Override per-instance (e.g. `{AppName}-{podName}`) to distinguish replicas. |
 
 `AppName` must be non-empty — `NewApplication` returns an error if it is missing.
+
+#### Setting `ConnectionName` per-pod on Kubernetes
+
+When you run multiple replicas, every pod will report the same `connection_name`
+(its `AppName`) on the broker — making it hard to tell replicas apart in the
+RabbitMQ Management UI. Use the [Kubernetes downward API](https://kubernetes.io/docs/concepts/workloads/pods/downward-api/)
+to expose the pod name as an env var, then read it from Go and stitch it into
+`ConnectionName`.
+
+**1. Expose pod metadata in your Deployment/StatefulSet:**
+
+```yaml
+spec:
+  template:
+    spec:
+      containers:
+        - name: my-service
+          env:
+            - name: APP_NAME
+              value: "my-service"
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+```
+
+`metadata.name` resolves to e.g. `my-service-7d9c8f6b4-xk2lp` (Deployment) or
+the stable `my-service-0` (StatefulSet).
+
+**2. Build `ConnectionName` from those env vars:**
+
+```go
+import (
+    "fmt"
+    "os"
+
+    "github.com/bancolombia/reactive-commons-go/rabbit"
+)
+
+func buildConnectionName(appName string) string {
+    if pod := os.Getenv("POD_NAME"); pod != "" {
+        return fmt.Sprintf("%s@%s", appName, pod)
+    }
+    if host, err := os.Hostname(); err == nil && host != "" {
+        return fmt.Sprintf("%s@%s", appName, host)
+    }
+    return appName
+}
+
+cfg := rabbit.NewConfigWithDefaults()
+cfg.AppName = os.Getenv("APP_NAME")
+cfg.ConnectionName = buildConnectionName(cfg.AppName)
+```
+
+The Management UI's Connections tab will then list each replica separately,
+e.g. `my-service@my-service-7d9c8f6b4-xk2lp`. Combine with `POD_NAMESPACE`
+when several namespaces share one RabbitMQ cluster:
+
+```go
+cfg.ConnectionName = fmt.Sprintf("%s/%s/%s",
+    cfg.AppName,
+    os.Getenv("POD_NAMESPACE"),
+    os.Getenv("POD_NAME"),
+)
+```
+
+**Note:** in Kubernetes the container's hostname already equals the pod name by
+default, so `os.Hostname()` works as a no-manifest fallback. The library
+automatically records `host` from `os.Hostname()` in the AMQP client-properties
+table regardless, but the explicit `POD_NAME` env var is the recommended
+contract for production manifests.
+
 
 ### Exchange Names
 
@@ -66,18 +143,40 @@ zero-configuration interoperability with `reactive-commons-java`.
 | `PersistentEvents` | `bool` | `true` | Publish domain events with delivery-mode 2 (persistent). Survives broker restart. |
 | `PersistentCommands` | `bool` | `true` | Publish commands with delivery-mode 2 (persistent). |
 | `PersistentQueries` | `bool` | `false` | Publish query requests with delivery-mode 2. Usually transient is fine. |
+| `QueueType` | `string` | `"classic"` | RabbitMQ queue type for durable consumer queues and their DLQs. Allowed values: `"classic"` or `"quorum"`. Mirrors reactive-commons-java's `app.async.app.queueType`. |
+
+#### Queue Type Notes
+
+`QueueType` only affects durable consumer and DLQ queues
+(`{appName}.subsEvents`, `{appName}`, `{appName}.query`, and their `.DLQ`
+siblings when `WithDLQRetry` is enabled). Temporary queues — the per-instance
+reply queue and the notification fan-out queue — are always classic, because
+they are declared exclusive auto-delete and quorum queues do not support those
+flags.
+
+`x-queue-type` is recorded on the queue at declaration time and is immutable
+for the queue's lifetime. If a queue with the same name already exists with a
+different type, the broker rejects redeclaration with `PRECONDITION_FAILED`
+(code 406). To switch types, delete the existing queue first.
 
 ### Dead-Letter Queue (DLQ) Retry
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `WithDLQRetry` | `bool` | `false` | Declare DLQ exchange and queue for events and commands. Failed messages are routed there after all retries are exhausted. |
-| `RetryDelay` | `time.Duration` | `1s` | Message TTL in the DLQ before being re-routed (requires `WithDLQRetry: true`). |
+| `WithDLQRetry` | `bool` | `false` | Declare delayed-retry DLQ topology for events, commands and queries. Matches reactive-commons-java's behaviour. |
+| `RetryDelay` | `time.Duration` | `1s` | DLQ message TTL before redelivery (requires `WithDLQRetry: true`). |
 
-When `WithDLQRetry` is enabled:
-- `domainEvents.DLQ` exchange (direct) and `{appName}.subsEvents.DLQ` queue are declared.
-- `directMessages.DLQ` exchange (direct) and `{appName}.DLQ` queue are declared.
-- Events/commands that are nacked exhaust requeue attempts and land in the DLQ.
+When `WithDLQRetry` is enabled the topology mirrors reactive-commons-java:
+
+- Events: `{appName}.{domainEventsExchange}` (topic, retry exchange),
+  `{appName}.{domainEventsExchange}.DLQ` (topic, DLQ exchange) and
+  `{appName}.subsEvents.DLQ` (DLQ queue with `x-message-ttl`).
+- Commands and queries: `{directMessagesExchange}.DLQ` (direct, shared DLQ
+  exchange), plus per-queue DLQ queues `{appName}.DLQ` and `{appName}.query.DLQ`
+  with `x-message-ttl` that dead-letter back to `directMessages`.
+- Listeners nack failed deliveries with `requeue=false`, so the broker dead-
+  letters them through the DLQ. Without `WithDLQRetry` the listeners requeue
+  immediately (infinite retry — only suitable for development).
 
 ### Observability
 
@@ -197,6 +296,7 @@ func buildConfig() rabbit.RabbitConfig {
         PersistentEvents:   true,
         PersistentCommands: true,
         PersistentQueries:  false,
+        QueueType:          "classic", // or "quorum" for HA in clusters
 
         // DLQ
         WithDLQRetry: true,

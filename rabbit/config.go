@@ -2,6 +2,7 @@ package rabbit
 
 import (
 	"errors"
+	"fmt"
 	"log/slog"
 	"time"
 )
@@ -19,6 +20,11 @@ type RabbitConfig struct {
 	// AppName is required. Used for queue naming (e.g. "{AppName}.subsEvents").
 	AppName string
 
+	// ConnectionName is advertised to RabbitMQ as the AMQP `connection_name`
+	// client property, making the connection identifiable in the Management UI
+	// and broker logs. Defaults to AppName when empty.
+	ConnectionName string
+
 	// Exchange names — defaults match reactive-commons-java
 	DomainEventsExchange   string // default: "domainEvents"
 	DirectMessagesExchange string // default: "directMessages"
@@ -32,6 +38,16 @@ type RabbitConfig struct {
 	PersistentQueries  bool          // default: false
 	WithDLQRetry       bool          // default: false
 	RetryDelay         time.Duration // default: 1s (used only when WithDLQRetry=true)
+
+	// QueueType selects the RabbitMQ queue type for durable consumer queues
+	// (events, commands, queries) and their DLQs. Allowed values: "classic"
+	// or "quorum". Default: "classic". Matches reactive-commons-java's
+	// `app.async.app.queueType`.
+	//
+	// Note: temporary queues (reply queue, notification queue) are always
+	// exclusive auto-delete and stay classic regardless of this setting,
+	// because quorum queues do not support those flags.
+	QueueType string
 
 	// Logger is an optional structured logger. Defaults to slog.Default() when nil.
 	Logger *slog.Logger
@@ -49,7 +65,7 @@ func (cfg RabbitConfig) WithDefaults() RabbitConfig {
 		cfg.Username = "guest"
 	}
 	if cfg.Password == "" {
-		cfg.Password = "guest"
+		cfg.Password = "guest" //NOSONAR go:S2068 - default RabbitMQ dev credential, not a real secret
 	}
 	if cfg.VirtualHost == "" {
 		cfg.VirtualHost = "/"
@@ -71,6 +87,12 @@ func (cfg RabbitConfig) WithDefaults() RabbitConfig {
 	}
 	if !cfg.WithDLQRetry || cfg.RetryDelay == 0 {
 		cfg.RetryDelay = 1 * time.Second
+	}
+	if cfg.QueueType == "" {
+		cfg.QueueType = "classic"
+	}
+	if cfg.ConnectionName == "" {
+		cfg.ConnectionName = cfg.AppName
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
@@ -100,14 +122,21 @@ func NewConfigWithDefaults() RabbitConfig {
 		PersistentQueries:      false,
 		WithDLQRetry:           false,
 		RetryDelay:             1 * time.Second,
+		QueueType:              "classic",
 		Logger:                 slog.Default(),
 	}
 }
 
-// Validate returns an error if cfg is missing required fields.
+// Validate returns an error if cfg is missing required fields or has an
+// invalid QueueType.
 func (cfg RabbitConfig) Validate() error {
 	if cfg.AppName == "" {
 		return errors.New("reactive-commons: RabbitConfig.AppName is required")
+	}
+	switch cfg.QueueType {
+	case "", "classic", "quorum":
+	default:
+		return fmt.Errorf("reactive-commons: RabbitConfig.QueueType must be \"classic\" or \"quorum\", got %q", cfg.QueueType)
 	}
 	return nil
 }

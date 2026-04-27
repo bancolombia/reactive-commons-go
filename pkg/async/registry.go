@@ -1,9 +1,13 @@
 package async
 
 // HandlerRegistry registers message handlers for a service instance.
-// All registration SHOULD occur before calling Application.Start().
-// Dynamic registration after Start() is supported; the implementation MUST
-// update queue bindings accordingly while the broker connection is live.
+//
+// All registration MUST occur before calling Application.Start(). Handlers
+// added after Start() will be stored but not bound on the broker (events and
+// notifications won't receive deliveries, since AMQP queue bindings are
+// declared once during Start). This differs from reactive-commons-java's
+// DynamicRegistry; if you need dynamic bindings, restart the application or
+// open a feature request.
 type HandlerRegistry interface {
 	// ListenEvent registers handler for the named domain event type.
 	// Returns ErrDuplicateHandler if a handler for eventName is already registered.

@@ -63,10 +63,17 @@ func (l *eventListener) Start(ctx context.Context, queueName string) error {
 }
 
 func (l *eventListener) dispatch(ctx context.Context, d amqp.Delivery) {
+	// requeueOnFailure controls whether handler failures put the message back on
+	// the same queue (true, immediate retry forever) or are nacked without
+	// requeue so the broker dead-letters into the configured DLX (false). When
+	// WithDLQRetry is on, we MUST nack without requeue so the TTL retry loop
+	// declared in topology.go can do its job — matching reactive-commons-java.
+	requeueOnFailure := !l.cfg.WithDLQRetry
+
 	defer func() {
 		if r := recover(); r != nil {
 			l.log.Error("reactive-commons: panic in event handler", "panic", r)
-			_ = d.Nack(false, true)
+			_ = d.Nack(false, requeueOnFailure)
 		}
 	}()
 
@@ -91,7 +98,7 @@ func (l *eventListener) dispatch(ctx context.Context, d amqp.Delivery) {
 
 	if err := handler(ctx, event); err != nil {
 		l.log.Error("reactive-commons: event handler error", "event", env.Name, "error", err)
-		_ = d.Nack(false, true)
+		_ = d.Nack(false, requeueOnFailure)
 		return
 	}
 	_ = d.Ack(false)

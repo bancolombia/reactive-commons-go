@@ -71,6 +71,43 @@ if err != nil {
 
 ---
 
+## Wildcard Subscriptions
+
+Event names may contain RabbitMQ topic-exchange wildcards so a single handler
+covers a family of related events:
+
+| Token | Matches |
+|-------|---------|
+| `*` | exactly one dot-separated segment |
+| `#` | zero or more segments |
+
+```go
+app.Registry().ListenEvent("order.*", handler)        // order.created, order.cancelled
+app.Registry().ListenEvent("inventory.#", handler)    // inventory, inventory.updated, inventory.v2.deleted
+```
+
+Resolution rules at dispatch time mirror
+[reactive-commons-java](https://github.com/reactive-commons/reactive-commons-java)'s
+`HandlerResolver`:
+
+1. An exact-name match always wins over any wildcard match.
+2. When only patterns match, the most specific is chosen (fewer wildcards
+   first; `*` is more specific than `#`; longer patterns break ties).
+3. Each concrete name resolves to a handler at most once and is then cached
+   for the life of the registry.
+
+You can mix exact handlers and wildcard handlers freely; the exact one always
+takes precedence:
+
+```go
+_ = app.Registry().ListenEvent("order.created", specificHandler) // wins for order.created
+_ = app.Registry().ListenEvent("order.*",       fallbackHandler) // fires for everything else under order.*
+```
+
+> Wildcards are not supported on `ServeQuery` — see [async-queries.md](async-queries.md).
+
+---
+
 ## Multiple Subscribers
 
 Each service that registers a handler gets its own durable queue bound to the `domainEvents`
@@ -130,17 +167,37 @@ cfg.PersistentEvents = false
 
 ---
 
-## Dead-Letter Queue (Optional)
+## Dead-Letter Queue and Delayed Retry (Optional)
 
-Enable DLQ retry to move repeatedly-failing events to a `.DLQ` queue for inspection:
+Enable DLQ retry to delay-redeliver failed events instead of looping immediately:
 
 ```go
 cfg.WithDLQRetry = true
 cfg.RetryDelay   = 5 * time.Second
 ```
 
-The DLQ exchange `domainEvents.DLQ` and queue `{appName}.subsEvents.DLQ` are declared
-automatically when `WithDLQRetry` is true.
+When enabled, the topology mirrors `reactive-commons-java`'s
+`ApplicationEventListener`:
+
+| Object | Type | Notes |
+|--------|------|-------|
+| `{appName}.{domainEventsExchange}` | topic, durable | Per-app retry exchange |
+| `{appName}.{domainEventsExchange}.DLQ` | topic, durable | Per-app DLQ exchange |
+| `{appName}.subsEvents` | durable | Origin queue, dead-letters to the DLQ exchange |
+| `{appName}.subsEvents.DLQ` | durable | DLQ queue, has `x-message-ttl=RetryDelay` and dead-letters back to the retry exchange |
+
+Flow on handler failure:
+
+1. The handler returns an error → the listener nacks with `requeue=false`.
+2. The broker dead-letters the message to `{appName}.{domainEventsExchange}.DLQ`,
+   which routes it to `{appName}.subsEvents.DLQ`.
+3. After `RetryDelay` ms the message TTL expires; the broker dead-letters it
+   to `{appName}.{domainEventsExchange}` (the per-app retry exchange), which
+   re-routes it to `{appName}.subsEvents` for a fresh attempt.
+
+Without `WithDLQRetry` the listener requeues failed deliveries immediately
+(infinite retry loop), so set `WithDLQRetry=true` for any non-trivial
+production deployment.
 
 ---
 

@@ -65,10 +65,12 @@ func (l *queryListener) Start(ctx context.Context, queueName string) error {
 }
 
 func (l *queryListener) dispatch(ctx context.Context, d amqp.Delivery) {
+	requeueOnFailure := !l.cfg.WithDLQRetry
+
 	defer func() {
 		if r := recover(); r != nil {
 			l.log.Error("reactive-commons: panic in query handler", "panic", r)
-			_ = d.Nack(false, true)
+			_ = d.Nack(false, requeueOnFailure)
 		}
 	}()
 

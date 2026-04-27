@@ -69,6 +69,48 @@ func TestRegistry_QueryNames_ReturnsRegisteredResources(t *testing.T) {
 	assert.ErrorIs(t, err, async.ErrDuplicateHandler)
 }
 
+func TestRegistry_ServeQuery_RejectsWildcardNames(t *testing.T) {
+	app := buildApp(t, "svc-query-wildcard")
+
+	noopQuery := func(ctx context.Context, q async.AsyncQuery[any], from async.From) (any, error) {
+		return nil, nil
+	}
+
+	err := app.Registry().ServeQuery("get-product.*", noopQuery)
+	assert.ErrorIs(t, err, async.ErrWildcardNotSupported)
+
+	err = app.Registry().ServeQuery("orders.#", noopQuery)
+	assert.ErrorIs(t, err, async.ErrWildcardNotSupported)
+
+	// Plain names still work after a rejection.
+	assert.NoError(t, app.Registry().ServeQuery("plain-query", noopQuery))
+}
+
+func TestRegistry_ListenEvent_AcceptsWildcardNames(t *testing.T) {
+	app := buildApp(t, "svc-event-wildcard")
+
+	noop := func(ctx context.Context, e async.DomainEvent[any]) error { return nil }
+
+	require.NoError(t, app.Registry().ListenEvent("order.*", noop))
+	require.NoError(t, app.Registry().ListenEvent("inventory.#", noop))
+}
+
+func TestRegistry_ListenCommand_AcceptsWildcardNames(t *testing.T) {
+	app := buildApp(t, "svc-cmd-wildcard")
+
+	noop := func(ctx context.Context, c async.Command[any]) error { return nil }
+
+	require.NoError(t, app.Registry().ListenCommand("invoice.*", noop))
+}
+
+func TestRegistry_ListenNotification_AcceptsWildcardNames(t *testing.T) {
+	app := buildApp(t, "svc-notif-wildcard")
+
+	noop := func(ctx context.Context, n async.Notification[any]) error { return nil }
+
+	require.NoError(t, app.Registry().ListenNotification("alerts.#", noop))
+}
+
 func TestConnection_OnReconnect_HookRegistered(t *testing.T) {
 	conn := irabbit.NewConnection(irabbit.Config{
 		Host:   "localhost",

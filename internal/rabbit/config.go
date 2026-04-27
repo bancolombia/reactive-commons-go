@@ -15,6 +15,10 @@ type Config struct {
 	VHost    string
 	AppName  string
 
+	// ConnectionName advertised to RabbitMQ as the `connection_name` client
+	// property. Empty falls back to AppName at dial time.
+	ConnectionName string
+
 	DomainEventsExchange   string
 	DirectMessagesExchange string
 	GlobalReplyExchange    string
@@ -26,6 +30,10 @@ type Config struct {
 	PersistentQueries  bool
 	WithDLQRetry       bool
 	RetryDelay         time.Duration
+
+	// QueueType is the RabbitMQ queue type ("classic" or "quorum") used for
+	// durable consumer queues and their DLQs. Empty means classic.
+	QueueType string
 
 	Logger *slog.Logger
 }

@@ -23,14 +23,18 @@ import (
 )
 
 // Package-level RabbitMQ connection details shared by all tests in this file.
+// rabbitMgmtPort is the management plugin's HTTP port (15672 by default) and
+// is only populated when the broker exposes it; tests that need it should
+// skip when it is zero.
 var (
-	rabbitHost string
-	rabbitPort int
+	rabbitHost     string
+	rabbitPort     int
+	rabbitMgmtPort int
 )
 
-// tryStartContainer attempts to start a RabbitMQ container. Returns (host, port, cleanup, ok).
+// tryStartContainer attempts to start a RabbitMQ container. Returns (host, amqpPort, mgmtPort, cleanup, ok).
 // Returns ok=false without panicking when Docker is unavailable.
-func tryStartContainer(ctx context.Context) (host string, port int, cleanup func(), ok bool) {
+func tryStartContainer(ctx context.Context) (host string, amqpPort, mgmtPort int, cleanup func(), ok bool) {
 	defer func() {
 		if r := recover(); r != nil {
 			ok = false
@@ -39,33 +43,41 @@ func tryStartContainer(ctx context.Context) (host string, port int, cleanup func
 
 	dockerImage := os.Getenv("TEST_RABBITMQ_IMAGE")
 	if dockerImage == "" {
-		dockerImage = "rabbitmq:3.12-alpine"
+		// The -management image keeps the same AMQP port (5672) and adds
+		// the management HTTP API on 15672, which the reconnect test uses
+		// to force-close a live broker connection.
+		dockerImage = "rabbitmq:3.12-management-alpine"
 	}
 
 	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
 		ContainerRequest: testcontainers.ContainerRequest{
 			Image:        dockerImage,
-			ExposedPorts: []string{"5672/tcp"},
+			ExposedPorts: []string{"5672/tcp", "15672/tcp"},
 			WaitingFor:   wait.ForListeningPort("5672/tcp").WithStartupTimeout(60 * time.Second),
 		},
 		Started: true,
 	})
 	if err != nil {
 		log.Printf("Failed to start RabbitMQ container: %v", err)
-		return "", 0, nil, false
+		return "", 0, 0, nil, false
 	}
 
 	h, err := container.Host(ctx)
 	if err != nil {
 		_ = container.Terminate(ctx)
-		return "", 0, nil, false
+		return "", 0, 0, nil, false
 	}
 	p, err := container.MappedPort(ctx, "5672")
 	if err != nil {
 		_ = container.Terminate(ctx)
-		return "", 0, nil, false
+		return "", 0, 0, nil, false
 	}
-	return h, p.Int(), func() { _ = container.Terminate(ctx) }, true
+	mp, mErr := container.MappedPort(ctx, "15672")
+	mgmt := 0
+	if mErr == nil {
+		mgmt = mp.Int()
+	}
+	return h, p.Int(), mgmt, func() { _ = container.Terminate(ctx) }, true
 }
 
 func TestMain(m *testing.M) {
@@ -83,11 +95,18 @@ func TestMain(m *testing.M) {
 		} else {
 			rabbitPort = 5672
 		}
+		if mgmtStr := os.Getenv("RABBITMQ_MGMT_PORT"); mgmtStr != "" {
+			p, err := strconv.Atoi(mgmtStr)
+			if err != nil {
+				log.Fatalf("invalid RABBITMQ_MGMT_PORT %q: %v", mgmtStr, err)
+			}
+			rabbitMgmtPort = p
+		}
 		os.Exit(m.Run())
 	}
 
 	// Priority 2: spin up a container via testcontainers-go
-	host, port, cleanup, ok := tryStartContainer(ctx)
+	host, port, mgmt, cleanup, ok := tryStartContainer(ctx)
 	if !ok {
 		// Docker is not available. Check if a local broker is already running.
 		conn, err := net.DialTimeout("tcp", "localhost:5672", 2*time.Second)
@@ -98,10 +117,17 @@ func TestMain(m *testing.M) {
 		_ = conn.Close()
 		rabbitHost = "localhost"
 		rabbitPort = 5672
+		// Best-effort: assume default management port. Reconnect test will
+		// skip if HTTP probe fails.
+		if mgmtConn, mgmtErr := net.DialTimeout("tcp", "localhost:15672", 2*time.Second); mgmtErr == nil {
+			_ = mgmtConn.Close()
+			rabbitMgmtPort = 15672
+		}
 		os.Exit(m.Run())
 	}
 	rabbitHost = host
 	rabbitPort = port
+	rabbitMgmtPort = mgmt
 
 	code := m.Run()
 	cleanup()
@@ -397,4 +423,79 @@ func TestEvents_HandlerReturnsError_MessageRedelivered(t *testing.T) {
 
 	assert.Eventually(t, func() bool { return successCount.Load() >= 1 }, 15*time.Second, 100*time.Millisecond,
 		"event handler error: consumer did not redeliver and succeed")
+}
+
+// TestEvents_WildcardSubscription_ReceivesMatchingEvents verifies that a
+// handler registered with a RabbitMQ topic pattern (e.g. "order.*") fires
+// for matching concrete event names. Uses the broker-side topic binding
+// directly: registering "order.*" creates an AMQP binding with that key
+// against the durable domainEvents exchange.
+func TestEvents_WildcardSubscription_ReceivesMatchingEvents(t *testing.T) {
+	cfg := rabbit.NewConfigWithDefaults()
+	cfg.AppName = fmt.Sprintf("test-wildcard-%d", time.Now().UnixNano())
+	cfg.Host = rabbitHost
+	cfg.Port = rabbitPort
+
+	app, err := rabbit.NewApplication(cfg)
+	require.NoError(t, err)
+
+	var matched, unmatched atomic.Int32
+	matchedNames := make(chan string, 4)
+
+	err = app.Registry().ListenEvent("order.*", func(ctx context.Context, e async.DomainEvent[any]) error {
+		matched.Add(1)
+		matchedNames <- e.Name
+		return nil
+	})
+	require.NoError(t, err)
+
+	// A second pattern that should NOT match "order.*" deliveries.
+	err = app.Registry().ListenEvent("invoice.#", func(ctx context.Context, e async.DomainEvent[any]) error {
+		unmatched.Add(1)
+		return nil
+	})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() { _ = app.Start(ctx) }()
+
+	select {
+	case <-app.Ready():
+	case <-time.After(30 * time.Second):
+		t.Fatal("app not ready")
+	}
+
+	// Emit two events that the topic binding "order.*" should deliver.
+	for _, name := range []string{"order.created", "order.cancelled"} {
+		err = app.EventBus().Emit(ctx, async.DomainEvent[any]{
+			Name:    name,
+			EventID: name + "-id",
+			Data:    map[string]any{"n": name},
+		})
+		require.NoError(t, err)
+	}
+
+	// Emit one that "order.*" must NOT match (multi-segment).
+	err = app.EventBus().Emit(ctx, async.DomainEvent[any]{
+		Name:    "order.v2.created",
+		EventID: "order-v2-id",
+		Data:    map[string]any{},
+	})
+	require.NoError(t, err)
+
+	assert.Eventually(t, func() bool { return matched.Load() >= 2 }, 10*time.Second, 100*time.Millisecond,
+		"wildcard handler did not receive both matching events")
+
+	// Drain to confirm names came through correctly.
+	close(matchedNames)
+	seen := map[string]bool{}
+	for n := range matchedNames {
+		seen[n] = true
+	}
+	assert.True(t, seen["order.created"], "order.created should reach order.* handler")
+	assert.True(t, seen["order.cancelled"], "order.cancelled should reach order.* handler")
+	assert.False(t, seen["order.v2.created"], "order.* must not match multi-segment names")
+
+	assert.Equal(t, int32(0), unmatched.Load(), "invoice.# handler must not fire for order.* events")
 }

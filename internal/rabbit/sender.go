@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
@@ -13,8 +14,13 @@ import (
 // It uses a single AMQP channel whose confirms are dispatched by a background
 // goroutine keyed by delivery tag — allowing multiple goroutines to call
 // SendWithConfirm concurrently without deadlocking.
+//
+// On a broker reconnect the channel that backs this Sender is closed by the
+// AMQP library; callers must invoke Reconnect to swap in a fresh channel
+// (and reset the broker-side delivery-tag sequence) before publishing again.
 type Sender struct {
 	mu      sync.Mutex
+	conn    *Connection
 	ch      *amqp.Channel
 	cfg     Config
 	nextTag uint64
@@ -34,6 +40,7 @@ func NewSender(conn *Connection, cfg Config) (*Sender, error) {
 	}
 
 	s := &Sender{
+		conn:    conn,
 		ch:      ch,
 		cfg:     cfg,
 		pending: make(map[uint64]chan error),
@@ -45,6 +52,52 @@ func NewSender(conn *Connection, cfg Config) (*Sender, error) {
 	go s.dispatchConfirms(confirms)
 
 	return s, nil
+}
+
+// Reconnect rebuilds the Sender's underlying publisher-confirm channel after
+// the broker connection has been re-established. The AMQP library closes the
+// previous channel when the connection drops, so any subsequent publish would
+// otherwise fail with "channel/connection is not open" forever. This method:
+//
+//   - releases any in-flight SendWithConfirm waiters with a transient error so
+//     callers fail fast instead of blocking until ctx expires;
+//   - resets the local delivery-tag counter (the broker also resets its own
+//     sequence on a fresh channel);
+//   - opens a new channel, re-enables publisher confirms, and starts a new
+//     dispatchConfirms goroutine on it.
+//
+// The previous dispatchConfirms goroutine exits on its own when the AMQP
+// library closes the old NotifyPublish channel.
+func (s *Sender) Reconnect() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.ch != nil {
+		_ = s.ch.Close()
+	}
+
+	for tag, ch := range s.pending {
+		select {
+		case ch <- fmt.Errorf("reactive-commons: publisher channel reset by reconnect"):
+		default:
+		}
+		delete(s.pending, tag)
+	}
+	s.nextTag = 0
+
+	ch, err := s.conn.Channel()
+	if err != nil {
+		return fmt.Errorf("reactive-commons: rebuild sender channel: %w", err)
+	}
+	if err := ch.Confirm(false); err != nil {
+		_ = ch.Close()
+		return fmt.Errorf("reactive-commons: re-enable publisher confirms: %w", err)
+	}
+	s.ch = ch
+
+	confirms := ch.NotifyPublish(make(chan amqp.Confirmation, 256))
+	go s.dispatchConfirms(confirms)
+	return nil
 }
 
 // dispatchConfirms runs until the confirms channel is closed (channel/connection shutdown).
@@ -86,6 +139,7 @@ func (s *Sender) SendWithConfirm(ctx context.Context, body []byte, exchange, rou
 		ContentType:  "application/json",
 		DeliveryMode: uint8(mode),
 		Timestamp:    time.Now(),
+		MessageId:    uuid.NewString(),
 		Headers:      headers,
 		AppId:        s.cfg.AppName,
 		Body:         body,
@@ -124,6 +178,7 @@ func (s *Sender) SendNoConfirm(ctx context.Context, body []byte, exchange, routi
 		ContentType:  "application/json",
 		DeliveryMode: uint8(mode),
 		Timestamp:    time.Now(),
+		MessageId:    uuid.NewString(),
 		Headers:      headers,
 		AppId:        s.cfg.AppName,
 		Body:         body,
