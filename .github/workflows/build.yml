@@ -74,18 +74,20 @@ jobs:
 
       - name: Unit tests with coverage
         run: |
-          PKGS=$(go list ./... | grep -v '/examples/' | paste -sd, -)
-          go test -race -covermode=atomic -coverpkg=$PKGS -coverprofile=coverage.unit.out ./...
+          mkdir -p coverage.covdata/unit
+          PKG_LIST=$(go list ./... | grep -v '/examples/')
+          PKGS=$(echo "$PKG_LIST" | paste -sd, -)
+          go test -race -covermode=atomic -coverpkg=$PKGS $PKG_LIST -args -test.gocoverdir=$PWD/coverage.covdata/unit
 
       - name: Integration tests with coverage
         run: |
+          mkdir -p coverage.covdata/integration
           PKGS=$(go list ./... | grep -v '/examples/' | paste -sd, -)
-          go test -tags integration -covermode=atomic -coverpkg=$PKGS -coverprofile=coverage.integration.out ./tests/integration/... -timeout 180s
+          go test -race -tags integration -covermode=atomic -coverpkg=$PKGS ./tests/integration/... -timeout 180s -args -test.gocoverdir=$PWD/coverage.covdata/integration
 
       - name: Merge coverage profiles
         run: |
-          go install github.com/wadey/gocovmerge@latest
-          "$(go env GOPATH)/bin/gocovmerge" coverage.unit.out coverage.integration.out > coverage.out
+          go tool covdata textfmt -i=coverage.covdata/unit,coverage.covdata/integration -o=coverage.out
 
 #      - name: Upload coverage to Codecov
 #        uses: codecov/codecov-action@v5

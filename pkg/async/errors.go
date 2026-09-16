@@ -23,3 +23,7 @@ var ErrDeserialize = errors.New("reactive-commons: failed to deserialize message
 // the direct exchange and cannot be addressed via topic patterns; this
 // matches reactive-commons-java's HandlerResolver.addQueryHandler check.
 var ErrWildcardNotSupported = errors.New("reactive-commons: wildcards are not supported in query handler names")
+
+// ErrRegistrationClosed is returned from HandlerRegistry methods when they
+// are called after Application.Start. Registration MUST happen before Start.
+var ErrRegistrationClosed = errors.New("reactive-commons: handler registration is closed after Start")

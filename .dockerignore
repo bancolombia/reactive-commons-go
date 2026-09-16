@@ -1,0 +1,11 @@
+.git
+.gitignore
+.github
+.idea
+.vscode
+docs
+tests
+coverage.out
+coverage.unit.out
+coverage.integration.out
+*.md
