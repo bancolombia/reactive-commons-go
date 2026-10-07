@@ -148,7 +148,7 @@ func waitForPort(host string, port int, timeout time.Duration) bool {
 
 func tryStartKafkaContainer(ctx context.Context) (host string, cleanup func(), ok bool) {
 	defer func() {
-		if r := recover(); r != nil {
+		if recover() != nil {
 			ok = false
 		}
 	}()
@@ -191,7 +191,7 @@ func tryStartKafkaContainerMacOS(ctx context.Context) (host string, cleanup func
 	}
 
 	defer func() {
-		if r := recover(); r != nil {
+		if recover() != nil {
 			ok = false
 		}
 	}()

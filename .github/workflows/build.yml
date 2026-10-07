@@ -50,9 +50,11 @@ jobs:
         if: github.ref == 'refs/heads/main'
         run: npm -g install --ignore-scripts @semantic-release/git semantic-release@23.0.0
 
+      # Run the globally installed binary directly instead of `npx`, which can
+      # fetch packages on-demand and run their lifecycle scripts (S6505).
       - name: Semantic Release
         if: github.ref == 'refs/heads/main'
-        run: npx semantic-release@23.0.0
+        run: semantic-release
         env:
           GITHUB_TOKEN: ${{ steps.generate_token.outputs.token }}
 

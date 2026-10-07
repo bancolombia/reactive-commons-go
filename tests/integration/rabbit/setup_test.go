@@ -116,7 +116,7 @@ func tryStartContainerMacOS(ctx context.Context) (host string, amqpPort, mgmtPor
 	}
 
 	defer func() {
-		if r := recover(); r != nil {
+		if recover() != nil {
 			ok = false
 		}
 	}()
@@ -165,7 +165,7 @@ func tryStartContainerMacOS(ctx context.Context) (host string, amqpPort, mgmtPor
 // Returns ok=false without panicking when Docker is unavailable.
 func tryStartContainer(ctx context.Context) (host string, amqpPort, mgmtPort int, cleanup func(), ok bool) {
 	defer func() {
-		if r := recover(); r != nil {
+		if recover() != nil {
 			ok = false
 		}
 	}()
