@@ -1,6 +1,6 @@
 //go:build integration
 
-package integration_test
+package rabbit_test
 
 import (
 	"context"
@@ -232,5 +232,4 @@ func TestNotifications_HandlerReturnsError_LogsAndContinues(t *testing.T) {
 
 	assert.Eventually(t, func() bool { return atomic.LoadInt32(&callCount) >= 1 }, 10*time.Second, 100*time.Millisecond,
 		"notification handler was not called")
-	// Consumer must still be running (no crash) — we can send a second one and it will be handled.
 }

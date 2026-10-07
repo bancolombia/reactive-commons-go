@@ -26,3 +26,4 @@ coverage.unit.out
 coverage.integration.out
 coverage_all.out
 coverage.html
+coverage.covdata/

@@ -277,3 +277,36 @@ RABBITMQ_HOST=localhost go test -tags integration ./tests/integration/...
 | [Resilience & Error Handling](docs/resilience.md) | Auto-reconnect, graceful shutdown, panic recovery, DLQ |
 | [Testing Guide](docs/testing.md) | Unit and integration test patterns, CI setup |
 | [Architecture](docs/architecture.md) | Internal design, package layout, concurrency model |
+| [Kafka support](docs/kafka.md) | Kafka backend (alpha) — events & notifications; commands/queries unsupported |
+| [Kafka vs RabbitMQ](docs/kafka-vs-rabbit.md) | Migration guide and method-by-method parity table |
+
+---
+
+## Kafka support (alpha)
+
+The `kafka` package
+provides an alternative broker for the **event** and **notification** patterns.
+It implements the same `pkg/async.Application` interface as the `rabbit`
+package, so switching backends is a constructor-and-config change with no
+call-site edits.
+
+```go
+app, err := kafka.NewApplication(kafka.KafkaConfig{
+    AppName:          "user-service",
+    BootstrapBrokers: []string{"localhost:9092"},
+})
+```
+
+Supported: `EventBus.Emit`, `EventBus.EmitNotification`,
+`Registry.ListenEvent` (retry + DLQ), `Registry.ListenNotification`
+(per-instance fan-out).
+
+Unsupported (returns `errors.Is(err, kafka.ErrNotSupportedOnKafka)`):
+commands, async queries, and their gateway/registry entry points.
+
+Runnable examples:
+- [`examples/kafka-emit-event`](examples/kafka-emit-event/) — publish a domain event
+- [`examples/kafka-listen-event`](examples/kafka-listen-event/) — consume with retry + DLQ
+- [`examples/kafka-emit-notification`](examples/kafka-emit-notification/) — publish a notification
+- [`examples/kafka-listen-notification`](examples/kafka-listen-notification/) — consume with per-instance fan-out
+- [`examples/kafka-emit-event-cloudevent`](examples/kafka-emit-event-cloudevent/) — carry a CloudEvent inside the envelope's `data` field
