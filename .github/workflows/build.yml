@@ -18,6 +18,45 @@ jobs:
       issues: write
       pull-requests: write
     runs-on: ubuntu-latest
+    services:
+      # Integration tests use these brokers (see KAFKA_BOOTSTRAP / RABBITMQ_*
+      # env below). Without them the test mains silently skip, which used to
+      # leave Sonar with unit-test coverage only.
+      kafka:
+        image: apache/kafka:latest
+        ports:
+          - 9092:9092
+        env:
+          KAFKA_NODE_ID: 1
+          KAFKA_PROCESS_ROLES: broker,controller
+          KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+          KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+          KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+          KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+          KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+          KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+          KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+          CLUSTER_ID: rc-ci-cluster
+        options: >-
+          --health-cmd "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 24
+      rabbitmq:
+        image: rabbitmq:3.12-management-alpine
+        ports:
+          - 5672:5672
+          - 15672:15672
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 24
+    env:
+      KAFKA_BOOTSTRAP: localhost:9092
+      RABBITMQ_HOST: localhost
+      RABBITMQ_PORT: "5672"
+      RABBITMQ_MGMT_PORT: "15672"
     steps:
       - name: Generate a token
         id: generate_token
@@ -85,7 +124,7 @@ jobs:
         run: |
           mkdir -p coverage.covdata/integration
           PKGS=$(go list ./... | grep -v '/examples/' | paste -sd, -)
-          go test -race -tags integration -covermode=atomic -coverpkg=$PKGS ./tests/integration/... -timeout 180s -args -test.gocoverdir=$PWD/coverage.covdata/integration
+          go test -race -tags integration -covermode=atomic -coverpkg=$PKGS ./tests/integration/... -timeout 600s -args -test.gocoverdir=$PWD/coverage.covdata/integration
 
       - name: Merge coverage profiles
         run: |
@@ -107,7 +146,7 @@ jobs:
             -Dsonar.projectKey=bancolombia_reactive-commons-go
             -Dsonar.organization=grupo-bancolombia
             -Dsonar.sources=.
-            -Dsonar.coverage.exclusions=**/*_test.go,**/examples/**
+            -Dsonar.coverage.exclusions=**/*_test.go,**/examples/**,tests/integration/kafka/interop/**
             -Dsonar.exclusions=**/*_test.go,**/examples/**
             -Dsonar.tests=.
             -Dsonar.test.inclusions=**/*_test.go
