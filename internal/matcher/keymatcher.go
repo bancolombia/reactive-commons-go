@@ -66,6 +66,19 @@ func matchSegments(pattern, key []string) bool {
 	return false
 }
 
+// Resolve returns the most specific pattern in keys that matches name, or ""
+// when no wildcard pattern matches. Exact matches are the caller's
+// responsibility (check the map first).
+func Resolve(name string, keys []string) string {
+	var candidates []string
+	for _, k := range keys {
+		if Matches(name, k) {
+			candidates = append(candidates, k)
+		}
+	}
+	return MostSpecific(candidates)
+}
+
 // MostSpecific returns the most specific pattern from candidates using the
 // same comparator as reactive-commons-java's KeyMatcher: fewer wildcards
 // beats more, '*' beats '#' at the same position, and longer patterns win

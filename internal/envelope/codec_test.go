@@ -85,11 +85,33 @@ func TestUnmarshalRaw_InvalidJSON(t *testing.T) {
 	assert.Error(t, err)
 }
 
-func TestUnmarshalRaw_MissingName(t *testing.T) {
+func TestUnmarshalRaw_RequiredFields(t *testing.T) {
 	t.Parallel()
-	_, err := UnmarshalRaw([]byte(`{"eventId":"id-1","data":{}}`))
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "name")
+
+	tests := []struct {
+		name    string
+		in      string
+		wantErr bool
+	}{
+		{name: "name only (event/command)", in: `{"name":"user.created","data":{}}`},
+		{name: "resource only (query)", in: `{"resource":"some.query","queryData":{}}`},
+		{name: "name and resource", in: `{"name":"n","resource":"r"}`},
+		{name: "both missing", in: `{"eventId":"id-1","data":{}}`, wantErr: true},
+		{name: "empty object", in: `{}`, wantErr: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			env, err := UnmarshalRaw([]byte(tc.in))
+			if tc.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.True(t, env.Name != "" || env.Resource != "")
+		})
+	}
 }
 
 func TestDecodeData(t *testing.T) {

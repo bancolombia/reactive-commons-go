@@ -13,11 +13,13 @@ Provides four async messaging patterns — **domain events**, **commands**, **as
 go get github.com/bancolombia/reactive-commons-go
 ```
 
-Requires Go 1.22+ and RabbitMQ 3.x.
+Requires Go 1.22+ and RabbitMQ 3.x and/or Kafka 
 
 ---
 
-## Quick Start
+## Quick Start 
+
+With RabbitMQ.
 
 ```go
 package main
@@ -277,7 +279,7 @@ RABBITMQ_HOST=localhost go test -tags integration ./tests/integration/...
 | [Resilience & Error Handling](docs/resilience.md) | Auto-reconnect, graceful shutdown, panic recovery, DLQ |
 | [Testing Guide](docs/testing.md) | Unit and integration test patterns, CI setup |
 | [Architecture](docs/architecture.md) | Internal design, package layout, concurrency model |
-| [Kafka support](docs/kafka.md) | Kafka backend (alpha) — events & notifications; commands/queries unsupported |
+| [Kafka support](docs/kafka.md) | Kafka backend (alpha) — events, notifications, commands & async queries |
 | [Kafka vs RabbitMQ](docs/kafka-vs-rabbit.md) | Migration guide and method-by-method parity table |
 
 ---
@@ -285,7 +287,8 @@ RABBITMQ_HOST=localhost go test -tags integration ./tests/integration/...
 ## Kafka support (alpha)
 
 The `kafka` package
-provides an alternative broker for the **event** and **notification** patterns.
+provides an alternative broker for the **event**, **notification**,
+**command**, and **async query** patterns.
 It implements the same `pkg/async.Application` interface as the `rabbit`
 package, so switching backends is a constructor-and-config change with no
 call-site edits.
@@ -299,14 +302,22 @@ app, err := kafka.NewApplication(kafka.KafkaConfig{
 
 Supported: `EventBus.Emit`, `EventBus.EmitNotification`,
 `Registry.ListenEvent` (retry + DLQ), `Registry.ListenNotification`
-(per-instance fan-out).
+(per-instance fan-out), `Gateway.SendCommand` / `Registry.ListenCommand`
+(retry + DLQ, wildcard names), and `Gateway.RequestReply` /
+`Registry.ServeQuery` / `Gateway.Reply`.
 
-Unsupported (returns `errors.Is(err, kafka.ErrNotSupportedOnKafka)`):
-commands, async queries, and their gateway/registry entry points.
+Topology: each app owns `{app}.commands` (competing consumers) and
+`{app}.queries` topics; query replies flow through a `{app}.replies` topic
+consumed per instance. Apps that never call `RequestReply` can set
+`DisableReplyListener` to skip the replies topic.
 
 Runnable examples:
-- [`examples/kafka-emit-event`](examples/kafka-emit-event/) — publish a domain event
-- [`examples/kafka-listen-event`](examples/kafka-listen-event/) — consume with retry + DLQ
-- [`examples/kafka-emit-notification`](examples/kafka-emit-notification/) — publish a notification
-- [`examples/kafka-listen-notification`](examples/kafka-listen-notification/) — consume with per-instance fan-out
-- [`examples/kafka-emit-event-cloudevent`](examples/kafka-emit-event-cloudevent/) — carry a CloudEvent inside the envelope's `data` field
+- [`examples/kafka/kafka-emit-event`](examples/kafka/kafka-emit-event/) — publish a domain event
+- [`examples/kafka/kafka-listen-event`](examples/kafka/kafka-listen-event/) — consume with retry + DLQ
+- [`examples/kafka/kafka-emit-notification`](examples/kafka/kafka-emit-notification/) — publish a notification
+- [`examples/kafka/kafka-listen-notification`](examples/kafka/kafka-listen-notification/) — consume with per-instance fan-out
+- [`examples/kafka/kafka-emit-event-cloudevent`](examples/kafka/kafka-emit-event-cloudevent/) — carry a CloudEvent inside the envelope's `data` field
+- [`examples/kafka/kafka-send-command`](examples/kafka/kafka-send-command/) — send a command
+- [`examples/kafka/kafka-listen-command`](examples/kafka/kafka-listen-command/) — handle commands with retry + DLQ
+- [`examples/kafka/kafka-request-reply`](examples/kafka/kafka-request-reply/) — send an async query
+- [`examples/kafka/kafka-serve-query`](examples/kafka/kafka-serve-query/) — serve queries and reply

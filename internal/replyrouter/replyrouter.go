@@ -1,4 +1,6 @@
-package rabbit
+// Package replyrouter correlates async-query replies to their waiting callers.
+// It is shared by the rabbit and kafka transports.
+package replyrouter
 
 import (
 	"sync"
@@ -44,11 +46,10 @@ func (r *ReplyRouter) Route(correlationID string, payload ReplyPayload) {
 	}
 }
 
-// Deregister removes the channel for correlationID and closes it.
+// Deregister removes the channel for correlationID. The channel is not
+// closed: a concurrent Route may hold a reference and a send on a closed
+// channel would panic. Callers stop reading after Deregister, so leaving the
+// channel open is safe.
 func (r *ReplyRouter) Deregister(correlationID string) {
-	if v, ok := r.channels.LoadAndDelete(correlationID); ok {
-		if ch, ok := v.(chan ReplyPayload); ok {
-			close(ch)
-		}
-	}
+	r.channels.LoadAndDelete(correlationID)
 }

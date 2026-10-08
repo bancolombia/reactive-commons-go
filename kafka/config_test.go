@@ -34,6 +34,15 @@ func TestWithDefaultsIsIdempotent(t *testing.T) {
 	require.NotNil(t, cfg.TopicNameFunc)
 	assert.Equal(t, "svc.user.created", cfg.TopicNameFunc("user.created"))
 
+	require.NotNil(t, cfg.CommandsTopicNameFunc)
+	assert.Equal(t, "svc.commands", cfg.CommandsTopicNameFunc("svc"))
+	assert.Equal(t, "remote.commands", cfg.CommandsTopicNameFunc("remote"))
+	require.NotNil(t, cfg.QueriesTopicNameFunc)
+	assert.Equal(t, "remote.queries", cfg.QueriesTopicNameFunc("remote"))
+	require.NotNil(t, cfg.RepliesTopicNameFunc)
+	assert.Equal(t, "svc.replies", cfg.RepliesTopicNameFunc("svc"))
+	assert.False(t, cfg.DisableReplyListener, "reply listener is enabled by default")
+
 	cfg2 := cfg.WithDefaults()
 	assert.Equal(t, cfg.ClientID, cfg2.ClientID)
 }

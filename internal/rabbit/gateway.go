@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/bancolombia/reactive-commons-go/internal/replyrouter"
 	"github.com/bancolombia/reactive-commons-go/pkg/async"
 	hdr "github.com/bancolombia/reactive-commons-go/pkg/headers"
 	"github.com/google/uuid"
@@ -17,15 +18,15 @@ import (
 type gateway struct {
 	sender      *Sender
 	cfg         Config
-	replyQueue  string       // name of this instance's reply queue (set after Start)
-	replyRouter *ReplyRouter // routes replies to waiting callers
+	replyQueue  string                   // name of this instance's reply queue (set after Start)
+	replyRouter *replyrouter.ReplyRouter // routes replies to waiting callers
 }
 
 func newGateway(sender *Sender, cfg Config) *gateway {
 	return &gateway{sender: sender, cfg: cfg}
 }
 
-func (g *gateway) withReplySupport(replyQueue string, router *ReplyRouter) {
+func (g *gateway) withReplySupport(replyQueue string, router *replyrouter.ReplyRouter) {
 	g.replyQueue = replyQueue
 	g.replyRouter = router
 }

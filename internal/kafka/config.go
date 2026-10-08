@@ -25,7 +25,12 @@ type Config struct {
 
 	TopicNameFunc             func(name string) string
 	NotificationTopicNameFunc func(name string) string
+	CommandsTopicNameFunc     func(appName string) string
+	QueriesTopicNameFunc      func(appName string) string
+	RepliesTopicNameFunc      func(appName string) string
 	ConsumerGroupPrefix       string
+
+	DisableReplyListener bool
 
 	ProducerAcks         kgo.RequiredAcks
 	ProducerBatchTimeout time.Duration

@@ -27,7 +27,24 @@ type KafkaConfig struct {
 
 	TopicNameFunc             func(name string) string
 	NotificationTopicNameFunc func(name string) string
-	ConsumerGroupPrefix       string
+	// CommandsTopicNameFunc derives the commands topic for an application.
+	// The listener calls it with this app's name; the gateway calls it with
+	// the target service name. Defaults to appName+".commands".
+	CommandsTopicNameFunc func(appName string) string
+	// QueriesTopicNameFunc derives the async-queries topic for an application,
+	// with the same caller contract as CommandsTopicNameFunc. Defaults to
+	// appName+".queries".
+	QueriesTopicNameFunc func(appName string) string
+	// RepliesTopicNameFunc derives this app's reply topic (where query
+	// responders publish). Defaults to appName+".replies".
+	RepliesTopicNameFunc func(appName string) string
+	ConsumerGroupPrefix  string
+
+	// DisableReplyListener skips reply-topic verification and the reply
+	// consumer at Start. Set it for apps that never call RequestReply; doing
+	// so makes RequestReply return an error and removes the {app}.replies
+	// topic requirement.
+	DisableReplyListener bool
 
 	ProducerAcks         kgo.RequiredAcks
 	ProducerBatchTimeout time.Duration
@@ -148,6 +165,15 @@ func (cfg KafkaConfig) applyRoutingDefaults() KafkaConfig {
 	if cfg.NotificationTopicNameFunc == nil {
 		appName := cfg.AppName
 		cfg.NotificationTopicNameFunc = func(n string) string { return appName + "." + n }
+	}
+	if cfg.CommandsTopicNameFunc == nil {
+		cfg.CommandsTopicNameFunc = func(appName string) string { return appName + ".commands" }
+	}
+	if cfg.QueriesTopicNameFunc == nil {
+		cfg.QueriesTopicNameFunc = func(appName string) string { return appName + ".queries" }
+	}
+	if cfg.RepliesTopicNameFunc == nil {
+		cfg.RepliesTopicNameFunc = func(appName string) string { return appName + ".replies" }
 	}
 	if cfg.ConsumerGroupPrefix == "" {
 		cfg.ConsumerGroupPrefix = cfg.AppName

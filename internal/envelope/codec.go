@@ -22,14 +22,16 @@ func Marshal(v any) ([]byte, error) {
 // UnmarshalRaw performs the first-phase decode of a wire envelope into
 // async.RawEnvelope, keeping `data` as json.RawMessage so the handler-side
 // second phase can decode into the concrete type. Returns an error when the
-// bytes are not JSON or the envelope has no `name` field.
+// bytes are not JSON or the envelope carries neither a `name` (events,
+// notifications, commands) nor a `resource` (queries). Callers enforce the
+// field required by their pattern.
 func UnmarshalRaw(b []byte) (async.RawEnvelope, error) {
 	var env async.RawEnvelope
 	if err := json.Unmarshal(b, &env); err != nil {
 		return async.RawEnvelope{}, fmt.Errorf("kafka: envelope decode: %w", err)
 	}
-	if env.Name == "" {
-		return async.RawEnvelope{}, fmt.Errorf("kafka: envelope decode: missing required field %q", "name")
+	if env.Name == "" && env.Resource == "" {
+		return async.RawEnvelope{}, fmt.Errorf("kafka: envelope decode: missing required fields %q and %q", "name", "resource")
 	}
 	return env, nil
 }
