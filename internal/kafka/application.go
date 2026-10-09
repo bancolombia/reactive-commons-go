@@ -90,26 +90,9 @@ func (a *KafkaApp) Start(ctx context.Context) error {
 	notifHandlers := a.registry.snapshotNotificationHandlers()
 	cmdHandlers := a.registry.snapshotCommandHandlers()
 	queryHandlers := a.registry.snapshotQueryHandlers()
-
-	topics := make([]string, 0, len(handlers)*2+len(notifHandlers)+3)
-	for name := range handlers {
-		topics = append(topics, topicForEvent(a.cfg, name))
-		topics = append(topics, topicForEvent(a.cfg, name)+a.cfg.DLQSuffix)
-	}
-	for name := range notifHandlers {
-		topics = append(topics, topicForNotification(a.cfg, name))
-	}
-	if len(cmdHandlers) > 0 {
-		cmdTopic := topicForCommand(a.cfg, a.cfg.AppName)
-		topics = append(topics, cmdTopic, cmdTopic+a.cfg.DLQSuffix)
-	}
-	if len(queryHandlers) > 0 {
-		topics = append(topics, topicForQuery(a.cfg, a.cfg.AppName))
-	}
 	replyEnabled := !a.cfg.DisableReplyListener
-	if replyEnabled {
-		topics = append(topics, topicForReply(a.cfg))
-	}
+
+	topics := collectTopicsToVerify(a.cfg, handlers, notifHandlers, cmdHandlers, queryHandlers, replyEnabled)
 	if err := verifyTopics(ctx, a.cfg, topics); err != nil {
 		_ = p.close()
 		return err
@@ -170,52 +153,95 @@ func (a *KafkaApp) Start(ctx context.Context) error {
 	a.mu.Unlock()
 
 	a.registry.markStarted()
-
-	for _, l := range listeners {
-		a.wg.Add(1)
-		go func(lst *eventListener) {
-			defer a.wg.Done()
-			lst.run(ctx)
-		}(l)
-	}
-	for _, l := range notifListeners {
-		a.wg.Add(1)
-		go func(lst *notificationListener) {
-			defer a.wg.Done()
-			lst.run(ctx)
-		}(l)
-	}
-	if cmdL != nil {
-		a.wg.Add(1)
-		go func(lst *commandListener) {
-			defer a.wg.Done()
-			lst.run(ctx)
-		}(cmdL)
-	}
-	if queryL != nil {
-		a.wg.Add(1)
-		go func(lst *queryListener) {
-			defer a.wg.Done()
-			lst.run(ctx)
-		}(queryL)
-	}
-	if replyL != nil {
-		a.wg.Add(1)
-		go func(lst *replyListener) {
-			defer a.wg.Done()
-			lst.run(ctx)
-		}(replyL)
-	}
-
+	a.spawnListeners(ctx, listeners, notifListeners, cmdL, queryL, replyL)
 	close(a.ready)
 
 	<-ctx.Done()
 
-	// Shutdown ordering per spec:
-	// (1) per-listener ctx already cancelled via ctx.Done;
-	// (2) wait for handler goroutines up to HandlerTimeout;
-	// (3) close readers;
-	// (4) close the producer last since DLQ and reply paths use it.
+	a.shutdown(p, listeners, notifListeners, cmdL, queryL, replyL)
+	return nil
+}
+
+// collectTopicsToVerify builds the full list of topics Start must verify
+// against the brokers before publishing the real gateway. The value types of
+// the handler maps are unused (only key presence and length matter), so the
+// function is generic over them.
+func collectTopicsToVerify[E, N, C, Q any](
+	cfg Config,
+	events map[string]E,
+	notifs map[string]N,
+	commands map[string]C,
+	queries map[string]Q,
+	replyEnabled bool,
+) []string {
+	topics := make([]string, 0, len(events)*2+len(notifs)+3)
+	for name := range events {
+		topics = append(topics, topicForEvent(cfg, name))
+		topics = append(topics, topicForEvent(cfg, name)+cfg.DLQSuffix)
+	}
+	for name := range notifs {
+		topics = append(topics, topicForNotification(cfg, name))
+	}
+	if len(commands) > 0 {
+		cmdTopic := topicForCommand(cfg, cfg.AppName)
+		topics = append(topics, cmdTopic, cmdTopic+cfg.DLQSuffix)
+	}
+	if len(queries) > 0 {
+		topics = append(topics, topicForQuery(cfg, cfg.AppName))
+	}
+	if replyEnabled {
+		topics = append(topics, topicForReply(cfg))
+	}
+	return topics
+}
+
+// spawn runs run(ctx) in a goroutine tracked by the app's wait group.
+func (a *KafkaApp) spawn(ctx context.Context, run func(context.Context)) {
+	a.wg.Add(1)
+	go func() {
+		defer a.wg.Done()
+		run(ctx)
+	}()
+}
+
+func (a *KafkaApp) spawnListeners(
+	ctx context.Context,
+	listeners []*eventListener,
+	notifListeners []*notificationListener,
+	cmdL *commandListener,
+	queryL *queryListener,
+	replyL *replyListener,
+) {
+	for _, l := range listeners {
+		a.spawn(ctx, l.run)
+	}
+	for _, l := range notifListeners {
+		a.spawn(ctx, l.run)
+	}
+	if cmdL != nil {
+		a.spawn(ctx, cmdL.run)
+	}
+	if queryL != nil {
+		a.spawn(ctx, queryL.run)
+	}
+	if replyL != nil {
+		a.spawn(ctx, replyL.run)
+	}
+}
+
+// shutdown implements the shutdown ordering spec:
+// (1) per-listener ctx is already cancelled via ctx.Done at the call site;
+// (2) wait for handler goroutines up to HandlerTimeout;
+// (3) close readers;
+// (4) close the producer last since DLQ and reply paths use it.
+func (a *KafkaApp) shutdown(
+	p *producer,
+	listeners []*eventListener,
+	notifListeners []*notificationListener,
+	cmdL *commandListener,
+	queryL *queryListener,
+	replyL *replyListener,
+) {
 	drained := make(chan struct{})
 	go func() { a.wg.Wait(); close(drained) }()
 	timeout := a.cfg.HandlerTimeout
@@ -228,34 +254,29 @@ func (a *KafkaApp) Start(ctx context.Context) error {
 		a.logger.Warn("kafka: handler drain timed out", "timeout", timeout)
 	}
 	for _, l := range listeners {
-		if err := l.close(); err != nil {
-			a.logger.Warn("kafka: listener close error", "topic", l.topic, "err", err)
-		}
+		a.logCloseErr("listener", l.topic, l.close())
 	}
 	for _, l := range notifListeners {
-		if err := l.close(); err != nil {
-			a.logger.Warn("kafka: notification listener close error", "topic", l.topic, "err", err)
-		}
+		a.logCloseErr("notification listener", l.topic, l.close())
 	}
 	if cmdL != nil {
-		if err := cmdL.close(); err != nil {
-			a.logger.Warn("kafka: command listener close error", "topic", cmdL.topic, "err", err)
-		}
+		a.logCloseErr("command listener", cmdL.topic, cmdL.close())
 	}
 	if queryL != nil {
-		if err := queryL.close(); err != nil {
-			a.logger.Warn("kafka: query listener close error", "topic", queryL.topic, "err", err)
-		}
+		a.logCloseErr("query listener", queryL.topic, queryL.close())
 	}
 	if replyL != nil {
-		if err := replyL.close(); err != nil {
-			a.logger.Warn("kafka: reply listener close error", "topic", replyL.topic, "err", err)
-		}
+		a.logCloseErr("reply listener", replyL.topic, replyL.close())
 	}
 	if err := p.close(); err != nil {
 		a.logger.Warn("kafka: producer close error", "err", err)
 	}
-	return nil
+}
+
+func (a *KafkaApp) logCloseErr(label, topic string, err error) {
+	if err != nil {
+		a.logger.Warn("kafka: "+label+" close error", "topic", topic, "err", err)
+	}
 }
 
 func verifyDial(ctx context.Context, cfg Config) error {
