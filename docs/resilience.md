@@ -1,11 +1,12 @@
 # Resilience & Error Handling
 
-`reactive-commons-go` is designed for production messaging workloads. It includes built-in
-mechanisms for reconnection, graceful shutdown, panic isolation, and dead-letter routing.
+`reactive-commons-go` provides resilience mechanisms for both brokers, but their behavior is
+backend-specific. The reconnect and AMQP dead-letter topology below describe RabbitMQ; Kafka
+behavior is summarized in [Kafka Resilience](#kafka-resilience).
 
 ---
 
-## Auto-Reconnect
+## RabbitMQ Auto-Reconnect
 
 The library automatically reconnects to RabbitMQ when the broker connection drops.
 
@@ -41,7 +42,7 @@ There is no configuration required — auto-reconnect is always active.
 
 ---
 
-## Graceful Shutdown
+## RabbitMQ Graceful Shutdown
 
 When the `context.Context` passed to `Start` is cancelled, the library performs an orderly shutdown:
 
@@ -80,7 +81,7 @@ app.Registry().ListenEvent("order.created",
 
 ---
 
-## Panic Recovery
+## RabbitMQ Panic Recovery
 
 Every consumer goroutine wraps handler invocations in a `recover()`. If a handler panics:
 
@@ -113,6 +114,25 @@ The log output will include:
   "stack": "goroutine 17 [running]:\n..."
 }
 ```
+
+---
+
+## Kafka Resilience
+
+Kafka does not use RabbitMQ's AMQP connection supervisor or exchange/queue DLQ topology. Kafka
+readers retry fetch errors after a fixed delay. Handler retry behavior depends on the pattern:
+
+| Pattern | Kafka behavior |
+|---------|----------------|
+| Events and commands | Handler failures retry up to `MaxRetryAttempts` (5 by default), with backoff from `RetryInitialDelay` up to `RetryMaxDelay`; exhausted messages go to `{topic}.dlq` |
+| Queries | Handler errors are returned to the requester as error replies; requests are committed without retry or DLQ |
+| Notifications | Handler errors are logged and dropped; no retry or DLQ |
+| Handler duration | Command and query handlers are bounded by `HandlerTimeout` (30 seconds by default) |
+| Shutdown | Waits for in-flight handlers up to `HandlerTimeout` |
+
+Kafka query replies are best-effort. If a reply is missed, the caller eventually receives a
+context timeout; there is no RabbitMQ-style `ReplyTimeout` setting. See
+[async-queries.md](async-queries.md#kafka-behavior-and-limitations) for details.
 
 ---
 

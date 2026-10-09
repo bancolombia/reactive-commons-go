@@ -241,12 +241,15 @@ Use `rabbit.NewConfigWithDefaults()` to get a config pre-populated with all defa
 
 ## Resilience
 
-- **Auto-reconnect**: on broker disconnection the library retries with exponential backoff
+- **RabbitMQ auto-reconnect**: on broker disconnection the library retries with exponential backoff
   (1 s → 2 s → … → 30 s cap) and re-declares topology + restarts consumers automatically.
-- **Panic recovery**: a panic inside any handler is caught, logged with a stack trace, and
+- **RabbitMQ panic recovery**: a panic inside a handler is caught, logged with a stack trace, and
   the consumer goroutine continues processing subsequent messages.
-- **Dead-letter queues**: set `WithDLQRetry: true` to automatically declare a DLQ exchange
+- **RabbitMQ dead-letter queues**: set `WithDLQRetry: true` to automatically declare a DLQ exchange
   and queue (`{exchange}.DLQ`) so failed messages can be inspected or replayed.
+- **Kafka retries**: event and command handler failures retry with backoff and then go to a
+    topic DLQ. Kafka query handlers have no retry/DLQ path, and notification handler failures are
+    dropped. See [Kafka support](docs/kafka.md) for delivery limitations.
 
 ---
 
@@ -256,11 +259,14 @@ Use `rabbit.NewConfigWithDefaults()` to get a config pre-populated with all defa
 # Unit tests (no broker required)
 make test-unit
 
-# Integration tests (requires Docker or a running RabbitMQ)
+# Integration tests (requires a container runtime for RabbitMQ and Kafka)
 make test-integration
 
-# Or set RABBITMQ_HOST / RABBITMQ_PORT to point at an existing broker
-RABBITMQ_HOST=localhost go test -tags integration ./tests/integration/...
+# Run just the RabbitMQ suite against an existing broker
+RABBITMQ_HOST=localhost RABBITMQ_PORT=5672 go test -tags integration ./tests/integration/rabbit/...
+
+# Run just the Kafka suite (uses testcontainers)
+go test -tags integration ./tests/integration/kafka/... -count=1 -timeout 240s
 ```
 
 ---
@@ -270,13 +276,13 @@ RABBITMQ_HOST=localhost go test -tags integration ./tests/integration/...
 | Guide | Description |
 |-------|-------------|
 | [Getting Started](docs/getting-started.md) | Installation, minimal setup, your first event |
-| [Domain Events](docs/domain-events.md) | Durable fan-out pub/sub — publish and subscribe |
+| [Domain Events](docs/domain-events.md) | Broker-specific event routing, fan-out, and delivery semantics |
 | [Commands](docs/commands.md) | Point-to-point instructions to a named service |
 | [Async Queries](docs/async-queries.md) | Request/reply with correlation and timeout |
-| [Notifications](docs/notifications.md) | Non-durable broadcast for cache invalidation and live signals |
-| [Java Interoperability](docs/java-interop.md) | Mix Go and Java services with zero configuration |
-| [Configuration Reference](docs/configuration.md) | All `RabbitConfig` fields with defaults and examples |
-| [Resilience & Error Handling](docs/resilience.md) | Auto-reconnect, graceful shutdown, panic recovery, DLQ |
+| [Notifications](docs/notifications.md) | Broker-specific broadcast and delivery semantics |
+| [Java Interoperability](docs/java-interop.md) | RabbitMQ/AMQP interoperability with reactive-commons-java |
+| [Configuration Reference](docs/configuration.md) | RabbitMQ `RabbitConfig`; Kafka config is documented separately |
+| [Resilience & Error Handling](docs/resilience.md) | Backend-specific retries, shutdown, and dead-letter behavior |
 | [Testing Guide](docs/testing.md) | Unit and integration test patterns, CI setup |
 | [Architecture](docs/architecture.md) | Internal design, package layout, concurrency model |
 | [Kafka support](docs/kafka.md) | Kafka backend (alpha) — events, notifications, commands & async queries |
@@ -290,8 +296,10 @@ The `kafka` package
 provides an alternative broker for the **event**, **notification**,
 **command**, and **async query** patterns.
 It implements the same `pkg/async.Application` interface as the `rabbit`
-package, so switching backends is a constructor-and-config change with no
-call-site edits.
+package, so common API calls can be retained when switching constructors and
+configuration. Delivery and routing semantics are not identical; review the
+[Kafka guide](docs/kafka.md) and [comparison table](docs/kafka-vs-rabbit.md)
+before migrating.
 
 ```go
 app, err := kafka.NewApplication(kafka.KafkaConfig{
@@ -308,8 +316,11 @@ Supported: `EventBus.Emit`, `EventBus.EmitNotification`,
 
 Topology: each app owns `{app}.commands` (competing consumers) and
 `{app}.queries` topics; query replies flow through a `{app}.replies` topic
-consumed per instance. Apps that never call `RequestReply` can set
-`DisableReplyListener` to skip the replies topic.
+consumed per instance. Query replies are best-effort and can be missed while
+the requester is unavailable. Apps that never call `RequestReply` can set
+`DisableReplyListener` to skip the replies topic. Kafka query handlers have no
+retry/DLQ path; commands and events do. Unknown command names are committed and
+discarded, and delayed commands are not supported.
 
 Runnable examples:
 - [`examples/kafka/kafka-emit-event`](examples/kafka/kafka-emit-event/) — publish a domain event

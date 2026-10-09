@@ -3,9 +3,10 @@
 Notifications are **non-durable broadcasts** — a lighter-weight fan-out mechanism for
 time-sensitive signals where missing a message is acceptable. They use the same `domainEvents`
 exchange as domain events but route to **temporary, auto-delete, exclusive** queues that
-exist only for the lifetime of the running subscriber.
+exist only for the lifetime of the running subscriber in RabbitMQ. Kafka also supports
+notifications, but uses topics and per-instance consumer groups instead of temporary queues.
 
-## Key Characteristics
+## RabbitMQ Characteristics
 
 | Property | Value |
 |----------|-------|
@@ -15,6 +16,26 @@ exist only for the lifetime of the running subscriber.
 | Delivery | Transient (delivery-mode 1) |
 | Guarantee | Best-effort — late-joining subscribers miss past notifications |
 | Fan-out | Every currently-running instance with a handler receives the notification |
+
+## Kafka Behavior and Limitations
+
+Kafka notifications use `{AppName}.{notificationName}` as the default topic. Each subscriber
+instance uses its own consumer group, providing fan-out to currently listening instances.
+Consumers start at the latest offset, so notifications published while an instance is stopped
+are not replayed when it restarts with a new default `InstanceID`.
+
+| Behavior | Kafka |
+|----------|-------|
+| Topic | `{AppName}.{notificationName}` by default; customize with `TopicNameFunc` |
+| Fan-out | Per-instance consumer groups receive their own copy while listening |
+| Offline instances | Missed notifications are not replayed by default |
+| Handler failure | Logged and dropped; no retry or DLQ |
+| Publish acknowledgement | `EmitNotification` waits for the configured Kafka producer acknowledgement |
+| Topic provisioning | Required topics must exist unless `AllowAutoCreateTopics` is enabled |
+
+As with events, the default topic includes `AppName`; publishers and subscribers in different
+applications need matching topic functions to communicate. See [kafka.md](kafka.md) and
+[kafka-vs-rabbit.md](kafka-vs-rabbit.md) for setup and backend comparison.
 
 ## Contrast with Domain Events
 
@@ -54,8 +75,9 @@ err := app.EventBus().EmitNotification(ctx, async.Notification[CacheInvalidated]
 })
 ```
 
-Unlike `Emit`, `EmitNotification` does **not** wait for a publisher confirm (fire-and-forget
-at the broker level). It returns an error only if the broker connection is unavailable.
+In RabbitMQ, `EmitNotification` does **not** wait for a publisher confirm (fire-and-forget at the
+broker level). Kafka's `EmitNotification` waits for the configured producer acknowledgement;
+these guarantees are backend-specific.
 
 ---
 

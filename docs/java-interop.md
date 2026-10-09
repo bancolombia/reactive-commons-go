@@ -1,9 +1,11 @@
-# Java Interoperability
+# RabbitMQ Java Interoperability (AMQP)
 
 `reactive-commons-go` is **wire-compatible** with
 [reactive-commons-java](https://github.com/reactive-commons/reactive-commons-java).
 Go and Java services communicate on the same broker with zero extra configuration as long
-as they share the same exchange names (the defaults match).
+as they use the RabbitMQ backend and share the same exchange names (the defaults match). This
+guide describes AMQP interoperability; the shared Go async API does not imply Kafka wire or
+topology compatibility with `reactive-commons-java`.
 
 ---
 
@@ -22,6 +24,14 @@ Both implementations use:
   redelivery)
 
 No adapter, bridge, or SDK shim is required. Mixing Go and Java services is transparent.
+
+## Kafka Interoperability Scope
+
+The Kafka integration test starts a raw Java Kafka consumer and verifies that it can read Go-
+produced event envelopes from Kafka topics. This verifies that tested envelope payloads can be
+consumed by that raw client; it does not verify interoperability with `reactive-commons-java`'s
+RabbitMQ transport or establish a Kafka backend for that Java library. Kafka topic and group
+configuration must be agreed on separately.
 
 ---
 
