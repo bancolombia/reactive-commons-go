@@ -3,7 +3,12 @@
 package replyrouter
 
 import (
+	"context"
+	"encoding/json"
+	"fmt"
 	"sync"
+
+	"github.com/bancolombia/reactive-commons-go/pkg/async"
 )
 
 // ReplyPayload carries a query reply body and its metadata flags.
@@ -52,4 +57,29 @@ func (r *ReplyRouter) Route(correlationID string, payload ReplyPayload) {
 // channel open is safe.
 func (r *ReplyRouter) Deregister(correlationID string) {
 	r.channels.LoadAndDelete(correlationID)
+}
+
+// AwaitReply blocks until a reply arrives on ch or ctx is cancelled, and
+// decodes the shared error/empty/body conventions used by every transport.
+// Returns async.ErrQueryTimeout on cancellation.
+func AwaitReply(ctx context.Context, ch <-chan ReplyPayload) (json.RawMessage, error) {
+	select {
+	case p := <-ch:
+		if p.IsError {
+			var errBody struct {
+				ErrorMessage string `json:"errorMessage"`
+			}
+			// Best-effort unmarshal — use raw body as fallback if it fails.
+			if unmarshalErr := json.Unmarshal(p.Body, &errBody); unmarshalErr != nil {
+				return nil, fmt.Errorf("reactive-commons: query handler error: %s", p.Body)
+			}
+			return nil, fmt.Errorf("reactive-commons: query handler error: %s", errBody.ErrorMessage)
+		}
+		if p.IsEmpty {
+			return nil, nil
+		}
+		return json.RawMessage(p.Body), nil
+	case <-ctx.Done():
+		return nil, async.ErrQueryTimeout
+	}
 }

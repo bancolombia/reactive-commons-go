@@ -2,7 +2,6 @@ package kafka
 
 import (
 	"context"
-	"errors"
 	"log/slog"
 	"time"
 
@@ -74,25 +73,13 @@ func (l *replyListener) close() error {
 // primed channel bounded by its own context.
 func (l *replyListener) run(ctx context.Context) {
 	l.awaitPrimed(ctx)
-
-	const fetchBackoff = 1 * time.Second
-	for {
-		msg, err := l.reader.ReadMessage(ctx)
-		if err != nil {
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
-				return
-			}
-			l.logger.Warn("kafka: reply fetch failed; retrying",
-				"topic", l.topic, "err", err, "backoff", fetchBackoff)
-			select {
-			case <-time.After(fetchBackoff):
-			case <-ctx.Done():
-				return
-			}
-			continue
-		}
-		l.route(ctx, msg)
-	}
+	consumerLoop{
+		kind:   "reply",
+		topic:  l.topic,
+		logger: l.logger,
+		fetch:  l.reader.ReadMessage,
+		handle: l.route,
+	}.run(ctx)
 }
 
 // awaitPrimed waits until every partition of the reply topic has completed at

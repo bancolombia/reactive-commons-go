@@ -80,25 +80,7 @@ func (g *gateway) RequestReply(ctx context.Context, query async.AsyncQuery[any],
 		return nil, err
 	}
 
-	select {
-	case p := <-replyCh:
-		if p.IsError {
-			var errBody struct {
-				ErrorMessage string `json:"errorMessage"`
-			}
-			// Best-effort unmarshal — use raw body as fallback if it fails.
-			if unmarshalErr := json.Unmarshal(p.Body, &errBody); unmarshalErr != nil {
-				return nil, fmt.Errorf("reactive-commons: query handler error: %s", p.Body)
-			}
-			return nil, fmt.Errorf("reactive-commons: query handler error: %s", errBody.ErrorMessage)
-		}
-		if p.IsEmpty {
-			return nil, nil
-		}
-		return json.RawMessage(p.Body), nil
-	case <-ctx.Done():
-		return nil, async.ErrQueryTimeout
-	}
+	return replyrouter.AwaitReply(ctx, replyCh)
 }
 
 // Reply sends the query response to the original caller identified by from.

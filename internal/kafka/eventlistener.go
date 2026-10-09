@@ -3,7 +3,6 @@ package kafka
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -89,24 +88,13 @@ func (l *eventListener) close() error {
 // group rebalance, temporary network drop) are logged and retried after a
 // short backoff; only a cancelled context terminates the loop.
 func (l *eventListener) run(ctx context.Context) {
-	const fetchBackoff = 1 * time.Second
-	for {
-		msg, err := l.reader.FetchMessage(ctx)
-		if err != nil {
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
-				return
-			}
-			l.logger.Warn("kafka: fetch failed; retrying",
-				"topic", l.topic, "err", err, "backoff", fetchBackoff)
-			select {
-			case <-time.After(fetchBackoff):
-			case <-ctx.Done():
-				return
-			}
-			continue
-		}
-		l.processMessage(ctx, msg)
-	}
+	consumerLoop{
+		kind:   "event",
+		topic:  l.topic,
+		logger: l.logger,
+		fetch:  l.reader.FetchMessage,
+		handle: l.processMessage,
+	}.run(ctx)
 }
 
 func (l *eventListener) processMessage(ctx context.Context, msg kgo.Message) {
