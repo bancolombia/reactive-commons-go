@@ -42,6 +42,24 @@ app, err := rabbit.NewApplication(cfg)
 | `Username` | `string` | `"guest"` | AMQP username |
 | `Password` | `string` | `"guest"` | AMQP password |
 | `VirtualHost` | `string` | `"/"` | AMQP virtual host |
+| `TLS` | `*tls.Config` | `nil` | Optional. When non-nil, the connection uses AMQPS (TLS) instead of plain AMQP. The broker must accept TLS on `Port` (typically 5671). `ServerName` defaults to `Host` when left empty. |
+
+#### Enabling TLS (AMQPS)
+
+Set `TLS` to a non-nil `*tls.Config` to connect over TLS instead of clear-text AMQP:
+
+```go
+cfg := rabbit.NewConfigWithDefaults()
+cfg.AppName = "my-service"
+cfg.Host    = "rabbitmq.prod.internal"
+cfg.Port    = 5671
+cfg.TLS     = &tls.Config{} // ServerName defaults to cfg.Host
+
+// For self-signed or private-CA brokers, load the CA pool explicitly:
+// cfg.TLS = &tls.Config{RootCAs: caPool, ServerName: "rabbitmq.prod.internal"}
+```
+
+When `TLS` is `nil` (the default) the connection uses `amqp://`; when non-nil it uses `amqps://` and forwards the config to the AMQP client. The same `TLS` setting applies to automatic reconnects.
 
 ### Identity
 

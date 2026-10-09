@@ -63,6 +63,7 @@ func toInternalConfig(cfg RabbitConfig) irabbit.Config {
 		WithDLQRetry:           cfg.WithDLQRetry,
 		RetryDelay:             cfg.RetryDelay,
 		QueueType:              cfg.QueueType,
+		TLS:                    cfg.TLS,
 		Logger:                 log,
 	}
 }

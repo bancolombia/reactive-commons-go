@@ -1,6 +1,7 @@
 package rabbit
 
 import (
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -48,6 +49,8 @@ type RabbitConfig struct {
 	// exclusive auto-delete and stay classic regardless of this setting,
 	// because quorum queues do not support those flags.
 	QueueType string
+	// TLS enables a TLS (AMQPS) connection when non-nil. Nil means plain AMQP.
+	TLS *tls.Config
 
 	// Logger is an optional structured logger. Defaults to slog.Default() when nil.
 	Logger *slog.Logger
