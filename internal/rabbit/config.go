@@ -1,6 +1,7 @@
 package rabbit
 
 import (
+	"crypto/tls"
 	"log/slog"
 	"time"
 )
@@ -14,6 +15,9 @@ type Config struct {
 	Password string
 	VHost    string
 	AppName  string
+
+	// TLS enables a TLS (AMQPS) connection when non-nil. Nil means plain AMQP.
+	TLS *tls.Config
 
 	// ConnectionName advertised to RabbitMQ as the `connection_name` client
 	// property. Empty falls back to AppName at dial time.

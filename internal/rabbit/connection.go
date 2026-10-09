@@ -98,17 +98,35 @@ func NewConnection(cfg Config) *Connection {
 	}
 }
 
+// dialURL builds the AMQP connection URL. The scheme is "amqps" when a TLS
+// configuration is set, otherwise "amqp" (clear-text).
+func (c *Connection) dialURL() string {
+	scheme := "amqp"
+	if c.cfg.TLS != nil {
+		scheme = "amqps"
+	}
+	return fmt.Sprintf("%s://%s:%s@%s:%d%s",
+		scheme, c.cfg.Username, c.cfg.Password, c.cfg.Host, c.cfg.Port, c.cfg.VHost)
+}
+
+// dialConfig returns the amqp.Config used for both the initial dial and
+// reconnects, carrying the optional TLS client configuration.
+func (c *Connection) dialConfig() amqp.Config {
+	return amqp.Config{
+		Vhost:           c.cfg.VHost,
+		Properties:      clientProperties(c.cfg),
+		Heartbeat:       10 * time.Second,
+		Locale:          "en_US",
+		TLSClientConfig: c.cfg.TLS,
+	}
+}
+
 // Dial establishes the AMQP connection and initialises the publisher channel pool.
 func (c *Connection) Dial() error {
-	url := fmt.Sprintf("amqp://%s:%s@%s:%d%s",
-		c.cfg.Username, c.cfg.Password, c.cfg.Host, c.cfg.Port, c.cfg.VHost)
+	url := c.dialURL()
 
-	conn, err := amqp.DialConfig(url, amqp.Config{
-		Vhost:      c.cfg.VHost,
-		Properties: clientProperties(c.cfg),
-		Heartbeat:  10 * time.Second,
-		Locale:     "en_US",
-	})
+	conn, err := amqp.DialConfig(url, c.dialConfig())
+
 	if err != nil {
 		return fmt.Errorf("reactive-commons: dial %s:%d: %w", c.cfg.Host, c.cfg.Port, err)
 	}
@@ -215,12 +233,7 @@ func (c *Connection) reconnectLoop(url string) {
 		c.log.Info("reactive-commons: attempting reconnect", "delay", backoff)
 		time.Sleep(backoff)
 
-		conn, err := amqp.DialConfig(url, amqp.Config{
-			Vhost:      c.cfg.VHost,
-			Properties: clientProperties(c.cfg),
-			Heartbeat:  10 * time.Second,
-			Locale:     "en_US",
-		})
+		conn, err := amqp.DialConfig(url, c.dialConfig())
 		if err != nil {
 			c.log.Warn("reactive-commons: reconnect failed", "error", err)
 			backoff = min(backoff*2, maxBackoff)
