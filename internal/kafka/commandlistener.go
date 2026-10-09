@@ -12,58 +12,36 @@ import (
 	kgo "github.com/segmentio/kafka-go"
 )
 
-// retryBackoff returns the delay before the (attempt+1)-th handler invocation.
-// attempt is 0-indexed: attempt=0 is the delay before the first retry after
-// the initial failure. delay = initial * 2^attempt, capped at maxDelay.
-func retryBackoff(attempt int, initial, maxDelay time.Duration) time.Duration {
-	if attempt < 0 {
-		attempt = 0
-	}
-	if initial <= 0 {
-		return 0
-	}
-	d := initial
-	for i := 0; i < attempt; i++ {
-		d *= 2
-		if d <= 0 || d >= maxDelay {
-			return maxDelay
-		}
-	}
-	if d > maxDelay {
-		return maxDelay
-	}
-	return d
-}
-
-// eventListener owns a *kafka.Reader and drives the durable, at-least-once
-// event delivery loop: fetch → decode → invoke handler (with retries) → DLQ
-// on exhaustion → manual offset commit.
-type eventListener struct {
+// commandListener owns a *kafka.Reader over the app's shared commands topic
+// and drives durable, at-least-once command delivery: fetch → decode →
+// dispatch by name (with retries) → DLQ on exhaustion → manual offset commit.
+//
+// Commands with no registered handler are silently discarded (rabbit
+// parity), as are commands matched by another instance's wildcard patterns.
+type commandListener struct {
 	cfg     Config
-	name    string
 	topic   string
 	groupID string
-	handler async.EventHandler[any]
+	reg     *handlerRegistry
 	dlq     *dlqProducer
 	reader  *kgo.Reader
 	logger  *slog.Logger
 	obs     *observability
 }
 
-func newEventListener(cfg Config, name string, handler async.EventHandler[any], p *producer, log *slog.Logger, obs *observability) *eventListener {
-	return &eventListener{
+func newCommandListener(cfg Config, reg *handlerRegistry, p *producer, log *slog.Logger, obs *observability) *commandListener {
+	return &commandListener{
 		cfg:     cfg,
-		name:    name,
-		topic:   topicForEvent(cfg, name),
-		groupID: groupIDForEvent(cfg, name),
-		handler: handler,
+		topic:   topicForCommand(cfg, cfg.AppName),
+		groupID: groupIDForCommand(cfg),
+		reg:     reg,
 		dlq:     newDLQProducer(cfg, p),
 		logger:  log,
 		obs:     obs,
 	}
 }
 
-func (l *eventListener) open() {
+func (l *commandListener) open() {
 	l.reader = kgo.NewReader(kgo.ReaderConfig{
 		Brokers:           l.cfg.BootstrapBrokers,
 		GroupID:           l.groupID,
@@ -77,19 +55,18 @@ func (l *eventListener) open() {
 	})
 }
 
-func (l *eventListener) close() error {
+func (l *commandListener) close() error {
 	if l == nil || l.reader == nil {
 		return nil
 	}
 	return l.reader.Close()
 }
 
-// run loops until ctx is cancelled. Transient fetch errors (broker restart,
-// group rebalance, temporary network drop) are logged and retried after a
-// short backoff; only a cancelled context terminates the loop.
-func (l *eventListener) run(ctx context.Context) {
+// run loops until ctx is cancelled. Transient fetch errors are logged and
+// retried after a short backoff; only a cancelled context terminates the loop.
+func (l *commandListener) run(ctx context.Context) {
 	consumerLoop{
-		kind:   "event",
+		kind:   "command",
 		topic:  l.topic,
 		logger: l.logger,
 		fetch:  l.reader.FetchMessage,
@@ -97,10 +74,13 @@ func (l *eventListener) run(ctx context.Context) {
 	}.run(ctx)
 }
 
-func (l *eventListener) processMessage(ctx context.Context, msg kgo.Message) {
+func (l *commandListener) processMessage(ctx context.Context, msg kgo.Message) {
 	raw, err := envelope.UnmarshalRaw(msg.Value)
+	if err == nil && raw.Name == "" {
+		err = fmt.Errorf("kafka: envelope decode: missing required field %q", "name")
+	}
 	if err != nil {
-		l.logger.Warn("kafka: envelope decode failed; routing to DLQ",
+		l.logger.Warn("kafka: command envelope decode failed; routing to DLQ",
 			"topic", l.topic, "err", err)
 		if dlqErr := l.dlq.publish(ctx, l.topic, msg, 0, "decode: "+err.Error()); dlqErr != nil {
 			l.logger.Error("kafka: DLQ publish failed after decode error",
@@ -111,19 +91,20 @@ func (l *eventListener) processMessage(ctx context.Context, msg kgo.Message) {
 		return
 	}
 
-	event := async.DomainEvent[any]{
-		Name:    raw.Name,
-		EventID: raw.EventID,
+	handler := l.reg.CommandHandler(raw.Name)
+	if handler == nil {
+		l.logger.Debug("kafka: no handler for command; discarding",
+			"topic", l.topic, "command", raw.Name)
+		l.commit(ctx, msg)
+		return
 	}
-	if len(raw.Data) > 0 {
-		var d any
-		if err := json.Unmarshal(raw.Data, &d); err != nil {
-			l.logger.Warn("kafka: data decode failed; passing raw json",
-				"topic", l.topic, "err", err)
-			event.Data = raw.Data
-		} else {
-			event.Data = d
-		}
+
+	// Data stays a json.RawMessage so the same handler code works on both
+	// transports (rabbit parity).
+	cmd := async.Command[any]{
+		Name:      raw.Name,
+		CommandID: raw.CommandID,
+		Data:      json.RawMessage(raw.Data),
 	}
 
 	attempts := l.cfg.MaxRetryAttempts
@@ -140,13 +121,13 @@ func (l *eventListener) processMessage(ctx context.Context, msg kgo.Message) {
 				return // graceful shutdown: no commit, message will redeliver
 			}
 		}
-		lastErr = l.invokeHandler(ctx, event)
+		lastErr = l.invokeHandler(ctx, handler, cmd)
 		if lastErr == nil {
 			l.commit(ctx, msg)
 			return
 		}
-		l.logger.Warn("kafka: handler error",
-			"topic", l.topic, "attempt", attempt+1, "err", lastErr)
+		l.logger.Warn("kafka: command handler error",
+			"topic", l.topic, "command", cmd.Name, "attempt", attempt+1, "err", lastErr)
 	}
 
 	reason := "handler exhausted retries"
@@ -164,27 +145,27 @@ func (l *eventListener) processMessage(ctx context.Context, msg kgo.Message) {
 // invokeHandler runs the handler with a per-message context bounded by
 // cfg.HandlerTimeout. Panics are converted to errors so a bad handler cannot
 // crash the loop. Wrapped in a consumer span and metric counters.
-func (l *eventListener) invokeHandler(ctx context.Context, event async.DomainEvent[any]) (err error) {
-	spanCtx, end := l.obs.startConsumeSpan(ctx, l.topic, "event")
-	l.obs.messagesConsumed.Add(spanCtx, 1, metricAttrs("kafka", l.topic, "event"))
+func (l *commandListener) invokeHandler(ctx context.Context, handler async.CommandHandler[any], cmd async.Command[any]) (err error) {
+	spanCtx, end := l.obs.startConsumeSpan(ctx, l.topic, "command")
+	l.obs.messagesConsumed.Add(spanCtx, 1, metricAttrs("kafka", l.topic, "command"))
 	start := time.Now()
 	defer func() {
 		if r := recover(); r != nil {
-			err = fmt.Errorf("kafka: handler panic: %v", r)
+			err = fmt.Errorf("kafka: command handler panic: %v", r)
 		}
 		l.obs.handlerDurationMs.Record(spanCtx, time.Since(start).Seconds(),
-			metricAttrs("kafka", l.topic, "event"))
+			metricAttrs("kafka", l.topic, "command"))
 		if err != nil {
-			l.obs.handlerErrors.Add(spanCtx, 1, metricAttrs("kafka", l.topic, "event"))
+			l.obs.handlerErrors.Add(spanCtx, 1, metricAttrs("kafka", l.topic, "command"))
 		}
 		end(err)
 	}()
 	hctx, cancel := context.WithTimeout(spanCtx, l.cfg.HandlerTimeout)
 	defer cancel()
-	return l.handler(hctx, event)
+	return handler(hctx, cmd)
 }
 
-func (l *eventListener) commit(ctx context.Context, msg kgo.Message) {
+func (l *commandListener) commit(ctx context.Context, msg kgo.Message) {
 	if err := l.reader.CommitMessages(ctx, msg); err != nil {
 		l.logger.Warn("kafka: commit failed",
 			"topic", l.topic, "partition", msg.Partition, "offset", msg.Offset, "err", err)

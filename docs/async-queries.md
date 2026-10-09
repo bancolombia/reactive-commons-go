@@ -2,10 +2,11 @@
 
 Async queries implement the request/reply messaging pattern: a caller sends a named query to a
 **specific target service** and waits — synchronously — for a typed response, with a configurable
-timeout. The transport is entirely asynchronous over AMQP; the synchronous appearance is
-achieved by a per-request correlation ID and a temporary reply queue.
+timeout. The topology and configuration below describe RabbitMQ. Kafka supports the same request/
+reply API, but uses topics and has different reply-delivery guarantees; see
+[Kafka behavior and limitations](#kafka-behavior-and-limitations).
 
-## Key Characteristics
+## RabbitMQ Characteristics
 
 | Property | Value |
 |----------|-------|
@@ -17,6 +18,27 @@ achieved by a per-request correlation ID and a temporary reply queue.
 | Reply queue | `{caller}.replies.{uuid}` (temp, auto-delete, exclusive) |
 | Default timeout | 15 seconds (configurable via `RabbitConfig.ReplyTimeout`) |
 | Caller blocks | Yes — `RequestReply` is synchronous from the caller's perspective |
+
+## Kafka Behavior and Limitations
+
+Kafka requests are published to `{targetService}.queries`. The caller listens on its
+`{app}.replies` topic, and the response is matched to the request by correlation ID. Unlike
+RabbitMQ, this does not use a per-request temporary reply queue.
+
+| Behavior | Kafka |
+|----------|-------|
+| Caller timeout | Controlled by the `context.Context` passed to `RequestReply`; there is no Kafka `ReplyTimeout` setting |
+| Reply delivery | Best-effort; replies use a per-instance consumer group starting at the latest offset |
+| Reply listener disabled | `DisableReplyListener` makes `RequestReply` unavailable and skips the local replies-topic requirement |
+| Query names | Exact names only; wildcard query handlers are unsupported |
+| Missing query handler | Request is committed without a reply, so the caller waits until its context expires |
+| Handler returns an error | Error is sent as a reply and the request is committed; no query retry or DLQ path |
+
+The replies topic must be available and the caller's reply listener running to receive a response.
+Since the listener starts at the latest offset, a reply produced while that caller is unavailable
+can be missed, causing the request to time out. Use a context deadline appropriate to the query
+and treat timeout as an expected failure mode. Kafka topic provisioning and backend differences
+are covered in [kafka.md](kafka.md) and [kafka-vs-rabbit.md](kafka-vs-rabbit.md).
 
 ---
 

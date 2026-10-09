@@ -5,19 +5,20 @@ import (
 	"log/slog"
 	"sync"
 
+	"github.com/bancolombia/reactive-commons-go/internal/replyrouter"
 	hdr "github.com/bancolombia/reactive-commons-go/pkg/headers"
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
 type replyListener struct {
 	conn   *Connection
-	router *ReplyRouter
+	router *replyrouter.ReplyRouter
 	cfg    Config
 	log    *slog.Logger
 	wg     *sync.WaitGroup
 }
 
-func newReplyListener(conn *Connection, router *ReplyRouter, cfg Config, wg *sync.WaitGroup) *replyListener {
+func newReplyListener(conn *Connection, router *replyrouter.ReplyRouter, cfg Config, wg *sync.WaitGroup) *replyListener {
 	return &replyListener{conn: conn, router: router, cfg: cfg, log: cfg.Logger, wg: wg}
 }
 
@@ -68,7 +69,7 @@ func (l *replyListener) route(d amqp.Delivery) {
 	isError := headerString(d.Headers, hdr.ReplyError) == "true"
 	isEmpty := headerString(d.Headers, hdr.CompletionOnlySignal) == "true"
 
-	l.router.Route(correlationID, ReplyPayload{
+	l.router.Route(correlationID, replyrouter.ReplyPayload{
 		Body:    d.Body,
 		IsError: isError,
 		IsEmpty: isEmpty,

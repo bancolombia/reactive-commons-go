@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/bancolombia/reactive-commons-go/internal/replyrouter"
 	"github.com/bancolombia/reactive-commons-go/pkg/async"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -22,7 +23,7 @@ func TestGateway_RequestReply_ErrorWhenReplyQueueNotInitialized(t *testing.T) {
 
 func TestGateway_WithReplySupport_StoresQueueAndRouter(t *testing.T) {
 	gw := newGateway(nil, Config{AppName: "svc"})
-	router := NewReplyRouter()
+	router := replyrouter.NewReplyRouter()
 
 	gw.withReplySupport("svc.replies.abc", router)
 
@@ -45,4 +46,3 @@ func TestGateway_Reply_MarshalError(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "marshal query reply")
 }
-

@@ -11,9 +11,9 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
-// Config is the internal mirror of kafka.KafkaConfig. Public callers never see
-// this type; kafka.NewApplication converts KafkaConfig -> Config before handing
-// it to NewKafkaApp.
+// Config is the canonical field layout underlying the public kafka.KafkaConfig.
+// Keep implementation-only runtime state outside this type to avoid exposing
+// it through the public configuration API.
 type Config struct {
 	AppName          string
 	BootstrapBrokers []string
@@ -25,7 +25,12 @@ type Config struct {
 
 	TopicNameFunc             func(name string) string
 	NotificationTopicNameFunc func(name string) string
+	CommandsTopicNameFunc     func(appName string) string
+	QueriesTopicNameFunc      func(appName string) string
+	RepliesTopicNameFunc      func(appName string) string
 	ConsumerGroupPrefix       string
+
+	DisableReplyListener bool
 
 	ProducerAcks         kgo.RequiredAcks
 	ProducerBatchTimeout time.Duration

@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/bancolombia/reactive-commons-go/internal/replyrouter"
 	"github.com/bancolombia/reactive-commons-go/pkg/async"
 	hdr "github.com/bancolombia/reactive-commons-go/pkg/headers"
 	"github.com/google/uuid"
@@ -17,15 +18,15 @@ import (
 type gateway struct {
 	sender      *Sender
 	cfg         Config
-	replyQueue  string       // name of this instance's reply queue (set after Start)
-	replyRouter *ReplyRouter // routes replies to waiting callers
+	replyQueue  string                   // name of this instance's reply queue (set after Start)
+	replyRouter *replyrouter.ReplyRouter // routes replies to waiting callers
 }
 
 func newGateway(sender *Sender, cfg Config) *gateway {
 	return &gateway{sender: sender, cfg: cfg}
 }
 
-func (g *gateway) withReplySupport(replyQueue string, router *ReplyRouter) {
+func (g *gateway) withReplySupport(replyQueue string, router *replyrouter.ReplyRouter) {
 	g.replyQueue = replyQueue
 	g.replyRouter = router
 }
@@ -79,25 +80,7 @@ func (g *gateway) RequestReply(ctx context.Context, query async.AsyncQuery[any],
 		return nil, err
 	}
 
-	select {
-	case p := <-replyCh:
-		if p.IsError {
-			var errBody struct {
-				ErrorMessage string `json:"errorMessage"`
-			}
-			// Best-effort unmarshal — use raw body as fallback if it fails.
-			if unmarshalErr := json.Unmarshal(p.Body, &errBody); unmarshalErr != nil {
-				return nil, fmt.Errorf("reactive-commons: query handler error: %s", p.Body)
-			}
-			return nil, fmt.Errorf("reactive-commons: query handler error: %s", errBody.ErrorMessage)
-		}
-		if p.IsEmpty {
-			return nil, nil
-		}
-		return json.RawMessage(p.Body), nil
-	case <-ctx.Done():
-		return nil, async.ErrQueryTimeout
-	}
+	return replyrouter.AwaitReply(ctx, replyCh)
 }
 
 // Reply sends the query response to the original caller identified by from.

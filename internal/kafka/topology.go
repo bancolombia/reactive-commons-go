@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+	"time"
 
 	kgo "github.com/segmentio/kafka-go"
 )
@@ -26,24 +27,118 @@ func topicForNotification(cfg Config, name string) string {
 	return cfg.AppName + "." + name
 }
 
+// topicForCommand returns the Kafka topic that carries commands addressed to
+// the given application (own app for the listener, target service for the
+// gateway).
+func topicForCommand(cfg Config, app string) string {
+	if cfg.CommandsTopicNameFunc != nil {
+		return cfg.CommandsTopicNameFunc(app)
+	}
+	return app + ".commands"
+}
+
+// topicForQuery returns the Kafka topic that carries async queries addressed
+// to the given application.
+func topicForQuery(cfg Config, app string) string {
+	if cfg.QueriesTopicNameFunc != nil {
+		return cfg.QueriesTopicNameFunc(app)
+	}
+	return app + ".queries"
+}
+
+// topicForReply returns the Kafka topic where this app's query replies are
+// published.
+func topicForReply(cfg Config) string {
+	if cfg.RepliesTopicNameFunc != nil {
+		return cfg.RepliesTopicNameFunc(cfg.AppName)
+	}
+	return cfg.AppName + ".replies"
+}
+
 // groupIDForEvent returns the shared consumer group ID used for competing
 // consumption of an event topic.
 func groupIDForEvent(cfg Config, name string) string {
-	prefix := cfg.ConsumerGroupPrefix
-	if prefix == "" {
-		prefix = cfg.AppName
-	}
-	return prefix + "." + name
+	return groupPrefix(cfg) + "." + name
 }
 
 // groupIDForNotification returns a per-instance consumer group ID used for
 // fan-out consumption of a notification topic.
 func groupIDForNotification(cfg Config, name, instanceID string) string {
-	prefix := cfg.ConsumerGroupPrefix
-	if prefix == "" {
-		prefix = cfg.AppName
+	return groupPrefix(cfg) + "." + name + "." + instanceID
+}
+
+// groupIDForCommand returns the shared consumer group ID used for competing
+// consumption of the app's commands topic.
+func groupIDForCommand(cfg Config) string {
+	return groupPrefix(cfg) + ".commands"
+}
+
+// groupIDForQuery returns the shared consumer group ID used for competing
+// consumption of the app's queries topic.
+func groupIDForQuery(cfg Config) string {
+	return groupPrefix(cfg) + ".queries"
+}
+
+// groupIDForReply returns a per-instance consumer group ID used for fan-out
+// consumption of the app's reply topic.
+func groupIDForReply(cfg Config) string {
+	return groupPrefix(cfg) + ".replies." + cfg.InstanceID
+}
+
+func groupPrefix(cfg Config) string {
+	if cfg.ConsumerGroupPrefix != "" {
+		return cfg.ConsumerGroupPrefix
 	}
-	return prefix + "." + name + "." + instanceID
+	return cfg.AppName
+}
+
+// partitionCount returns the number of partitions of topic by asking a broker.
+// Used to size the reply-listener priming wait. Returns ErrBrokerUnreachable
+// when no broker can be dialed.
+func partitionCount(ctx context.Context, cfg Config, topic string) (int, error) {
+	d := dialer(cfg)
+	var lastErr error
+	for _, addr := range cfg.BootstrapBrokers {
+		conn, err := d.DialContext(ctx, "tcp", addr)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		partitions, err := conn.ReadPartitions(topic)
+		_ = conn.Close()
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		return len(partitions), nil
+	}
+	if lastErr == nil {
+		lastErr = errors.New("no brokers configured")
+	}
+	return 0, fmt.Errorf("%w: %w", ErrBrokerUnreachable, lastErr)
+}
+
+// replyTopicPartitions returns the partition count of the reply topic,
+// retrying briefly to ride out metadata propagation right after the topic was
+// created. Falls back to 1 with an error when the lookup keeps failing.
+func replyTopicPartitions(ctx context.Context, cfg Config) (int, error) {
+	topic := topicForReply(cfg)
+	var lastErr error
+	for attempt := 0; attempt < 5; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return 1, lastErr
+			case <-time.After(200 * time.Millisecond):
+			}
+		}
+		n, err := partitionCount(ctx, cfg, topic)
+		if err == nil && n > 0 {
+			return n, nil
+		}
+		lastErr = err
+	}
+	return 1, lastErr
 }
 
 // verifyTopics checks that every entry in topics exists on the cluster; when a

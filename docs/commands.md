@@ -1,9 +1,11 @@
 # Commands
 
 Commands are point-to-point instructions directed at a **specific named service**. Unlike events,
-only one service receives each command — the service whose `AppName` matches the routing key.
+only one service receives each command — the service whose `AppName` matches the destination.
+The examples and topology below describe the RabbitMQ backend; Kafka implements the same command
+API with different delivery and routing semantics.
 
-## Key Characteristics
+## RabbitMQ Characteristics
 
 | Property | Value |
 |----------|-------|
@@ -13,6 +15,30 @@ only one service receives each command — the service whose `AppName` matches t
 | Delivery | Persistent (delivery-mode 2) by default |
 | Guarantee | At-least-once (broker confirms on send; nack triggers redelivery) |
 | Fan-out | None — exactly one service receives each command |
+
+## Kafka Behavior and Limitations
+
+Kafka commands are published to the target application's `{app}.commands` topic. Instances of
+that application share a consumer group, so each command is processed by one instance in the
+group. Kafka does not use RabbitMQ exchanges or queues for command routing.
+
+| Behavior | Kafka |
+|----------|-------|
+| Handler failure | Retried up to `KafkaConfig.MaxRetryAttempts` (5 by default), with backoff; then sent to `{app}.commands.dlq` |
+| Unknown command name | Committed and discarded; it is not retried or sent to the DLQ |
+| Wildcard handler names | Supported at dispatch time, but replicas must register compatible handlers |
+| Delayed commands | Not supported by the Kafka backend |
+| Topic provisioning | Required topics must exist unless `AllowAutoCreateTopics` is enabled |
+
+Because instances in a consumer group can receive a command on any replica, registering a
+wildcard handler on only some instances is unsafe: a message consumed by an instance without a
+matching handler is discarded as unknown. Register the same command handlers on every replica.
+
+Kafka's command publisher does not check that a target service has a handler registered. A
+missing command topic may prevent publishing or startup depending on broker topic-creation
+settings; a missing command name on a running consumer is committed and discarded. See
+[kafka.md](kafka.md) and [kafka-vs-rabbit.md](kafka-vs-rabbit.md) for backend setup and a
+side-by-side comparison.
 
 ---
 

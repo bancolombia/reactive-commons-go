@@ -3,7 +3,6 @@ package kafka
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -66,24 +65,13 @@ func (l *notificationListener) close() error {
 }
 
 func (l *notificationListener) run(ctx context.Context) {
-	const fetchBackoff = 1 * time.Second
-	for {
-		msg, err := l.reader.ReadMessage(ctx)
-		if err != nil {
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
-				return
-			}
-			l.logger.Warn("kafka: notification fetch failed; retrying",
-				"topic", l.topic, "err", err, "backoff", fetchBackoff)
-			select {
-			case <-time.After(fetchBackoff):
-			case <-ctx.Done():
-				return
-			}
-			continue
-		}
-		l.processMessage(ctx, msg)
-	}
+	consumerLoop{
+		kind:   "notification",
+		topic:  l.topic,
+		logger: l.logger,
+		fetch:  l.reader.ReadMessage,
+		handle: l.processMessage,
+	}.run(ctx)
 }
 
 func (l *notificationListener) processMessage(ctx context.Context, msg kgo.Message) {

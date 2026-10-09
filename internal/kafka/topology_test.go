@@ -62,6 +62,59 @@ func TestTopicAndGroupIDDerivation(t *testing.T) {
 			fn:      func(c Config) string { return groupIDForEvent(c, "user.created") },
 			wantOut: "svc.user.created",
 		},
+		{
+			name:    "command topic targets the given app",
+			cfg:     base,
+			fn:      func(c Config) string { return topicForCommand(c, "remote") },
+			wantOut: "remote.commands",
+		},
+		{
+			name:    "query topic targets the given app",
+			cfg:     base,
+			fn:      func(c Config) string { return topicForQuery(c, "remote") },
+			wantOut: "remote.queries",
+		},
+		{
+			name:    "reply topic uses own AppName",
+			cfg:     base,
+			fn:      func(c Config) string { return topicForReply(c) },
+			wantOut: "svc.replies",
+		},
+		{
+			name: "command/query/reply topic func overrides",
+			cfg: Config{
+				AppName:               "svc",
+				CommandsTopicNameFunc: func(app string) string { return "cmds." + app },
+				QueriesTopicNameFunc:  func(app string) string { return "qs." + app },
+				RepliesTopicNameFunc:  func(app string) string { return "replies." + app },
+			},
+			fn: func(c Config) string {
+				return topicForCommand(c, "remote") + "|" + topicForQuery(c, "remote") + "|" + topicForReply(c)
+			},
+			wantOut: "cmds.remote|qs.remote|replies.svc",
+		},
+		{
+			name:    "command group ID",
+			cfg:     base,
+			fn:      func(c Config) string { return groupIDForCommand(c) },
+			wantOut: "svc.commands",
+		},
+		{
+			name:    "query group ID",
+			cfg:     base,
+			fn:      func(c Config) string { return groupIDForQuery(c) },
+			wantOut: "svc.queries",
+		},
+		{
+			name: "reply group ID includes instance",
+			cfg: Config{
+				AppName:             "svc",
+				ConsumerGroupPrefix: "svc",
+				InstanceID:          "i-9",
+			},
+			fn:      func(c Config) string { return groupIDForReply(c) },
+			wantOut: "svc.replies.i-9",
+		},
 	}
 
 	for _, tc := range tests {

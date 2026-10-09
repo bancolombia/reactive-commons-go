@@ -25,6 +25,10 @@ reactive-commons-go/
 │   ├── config.go       # RabbitConfig, NewConfigWithDefaults, Validate
 │   └── builder.go      # NewApplication — thin wrapper over internal RabbitApp
 │
+├── kafka/              # Public factory (importable by consumers)
+│   ├── config.go       # KafkaConfig, topic routing, defaults, validation
+│   └── builder.go      # NewApplication — Kafka backend factory
+│
 ├── internal/rabbit/    # RabbitMQ implementation (not exported)
 │   ├── application.go  # RabbitApp — lifecycle coordinator
 │   ├── connection.go   # AMQP connection + channel pool + reconnect
@@ -44,14 +48,28 @@ reactive-commons-go/
 ├── internal/utils/
 │   └── namegen.go      # Queue/exchange name generation
 │
+├── internal/kafka/     # Kafka implementation (not exported)
+│   ├── application.go  # Lifecycle and topic verification
+│   ├── connection.go   # Kafka broker connectivity
+│   ├── topology.go     # Topic provisioning and routing
+│   ├── producer.go     # Kafka message publishing
+│   ├── eventbus.go     # Event and notification publishing
+│   ├── gateway.go      # Command and query publishing/replies
+│   ├── registry.go     # In-memory handler registry
+│   ├── eventlistener.go
+│   ├── commandlistener.go
+│   ├── querylistener.go
+│   ├── replylistener.go
+│   └── notificationlistener.go
+│
 └── tests/
     ├── unit/           # No broker; pure Go logic tests
-    └── integration/    # testcontainers-go; real RabbitMQ
+    └── integration/    # testcontainers-go; real RabbitMQ and Kafka
 ```
 
 ---
 
-## Layered Design
+## RabbitMQ Layered Design
 
 ```
 ┌─────────────────────────────────────────────────────┐
@@ -77,13 +95,13 @@ reactive-commons-go/
 └──────────────────────────────────────────────────────┘
 ```
 
-The `pkg/async` package has **no RabbitMQ dependency** — it contains only interface definitions
-and type declarations. This makes it possible to add a Kafka backend in a future phase without
-breaking existing consumers.
+The `pkg/async` package has no broker dependency. Both public factories implement its interfaces,
+while `internal/rabbit/` and `internal/kafka/` provide broker-specific behavior. The shared API
+does not make transport semantics identical; see [kafka-vs-rabbit.md](kafka-vs-rabbit.md).
 
 ---
 
-## Startup Sequence
+## RabbitMQ Startup Sequence
 
 `Start(ctx)` executes the following steps synchronously before closing the `Ready()` channel:
 
@@ -106,9 +124,18 @@ breaking existing consumers.
 16. Graceful shutdown (drain in-flight handlers, close connection)
 ```
 
+## Kafka Startup
+
+The Kafka application validates its configuration, resolves topics for registered handlers, and
+verifies or creates required topics according to `AllowAutoCreateTopics`. It then starts the
+producer and registered consumers, including the reply consumer unless `DisableReplyListener` is
+set, before signaling `Ready()`. Sender-only applications cannot verify every remote target
+topic during startup because a command or query target is only known when it is sent. See
+[kafka.md](kafka.md#topic-provisioning).
+
 ---
 
-## Connection Pool
+## RabbitMQ Connection Pool
 
 `Connection` maintains:
 
@@ -146,7 +173,7 @@ type is resolved.
 
 ---
 
-## Reply Router
+## RabbitMQ Reply Router
 
 The `ReplyRouter` manages in-flight query correlations. It is backed by a `sync.Map` for
 lock-free concurrent access.
@@ -170,7 +197,7 @@ arriving for a deregistered ID is silently dropped — no goroutine leak, no pan
 
 ---
 
-## Goroutine Model
+## RabbitMQ Goroutine Model
 
 Each consumer listener runs as a **single long-lived goroutine** that processes messages
 from an AMQP delivery channel sequentially:
@@ -200,7 +227,7 @@ app.Registry().ListenEvent("order.created",
 
 ---
 
-## Queue / Exchange Name Generation
+## RabbitMQ Queue / Exchange Name Generation
 
 `internal/utils/namegen.go` mirrors the Java `NameGenerator`:
 
@@ -229,7 +256,7 @@ instance**. This ensures temporary queues are unique across restarts.
 
 ---
 
-## Future Extension Points
+## Broker-Agnostic API
 
 The public API is intentionally broker-agnostic:
 
@@ -237,8 +264,10 @@ The public API is intentionally broker-agnostic:
 - `pkg/async.DomainEventBus` — publishable without a specific connection type
 - Handler registry — pure in-memory; no broker dependency
 
-A Kafka implementation could be added under `kafka/` providing `kafka.NewApplication(cfg)`,
-returning the same `async.Application` interface without any changes to consumer code.
+The Kafka implementation already exists under `kafka/` and `internal/kafka/`. Switching the
+constructor and configuration preserves the shared API calls, but applications should account
+for backend-specific delivery and routing differences documented in
+[kafka-vs-rabbit.md](kafka-vs-rabbit.md).
 
 ---
 

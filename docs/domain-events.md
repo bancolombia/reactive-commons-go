@@ -2,8 +2,10 @@
 
 Domain events represent immutable facts that happened in your system. They are published to
 **all** subscribed services — a classic fan-out / pub-sub pattern using a durable topic exchange.
+The topology and guarantees described below are RabbitMQ-specific. Kafka also supports domain
+events, using topics and consumer groups with different fan-out semantics.
 
-## Key Characteristics
+## RabbitMQ Characteristics
 
 | Property | Value |
 |----------|-------|
@@ -13,6 +15,28 @@ Domain events represent immutable facts that happened in your system. They are p
 | Delivery | Persistent (delivery-mode 2) by default |
 | Guarantee | At-least-once (broker confirms on publish; nack triggers redelivery) |
 | Fanout | Every service with a handler for the event name receives its own copy |
+
+## Kafka Behavior and Limitations
+
+Kafka publishes an event to `{AppName}.{eventName}` by default. Consumers for the same app and
+event share a consumer group, so replicas compete to process each event; they do not each receive
+a separate copy. Independent applications can each receive a copy only when they consume the
+same topic in distinct groups.
+
+| Behavior | Kafka |
+|----------|-------|
+| Topic | `{AppName}.{eventName}` by default; customize with `TopicNameFunc` |
+| Replicas of one app | Share a consumer group and compete for messages |
+| Different apps | Receive copies only if configured to consume the same topic |
+| Wildcard subscriptions | RabbitMQ topic wildcards do not apply; Kafka listeners use per-event topics |
+| Handler failure | Retried up to `MaxRetryAttempts`, then sent to `{topic}.dlq` |
+| Topic provisioning | Required topics must exist unless `AllowAutoCreateTopics` is enabled |
+
+Default topic names include the application name. A publisher and consumer with different
+`AppName` values therefore do not automatically share an event topic. Configure compatible topic
+functions on both sides for cross-application subscriptions. Register exact event names; a name
+such as `order.*` is not a Kafka wildcard subscription. See [kafka.md](kafka.md) and
+[kafka-vs-rabbit.md](kafka-vs-rabbit.md) for setup and backend comparison.
 
 ---
 

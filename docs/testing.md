@@ -3,8 +3,8 @@
 `reactive-commons-go` has two test suites:
 
 - **Unit tests** (`tests/unit/`) — no broker required; fast; run continuously during development
-- **Integration tests** (`tests/integration/`) — require a RabbitMQ instance; validate real
-  broker behaviour using [testcontainers-go](https://golang.testcontainers.org/)
+- **Integration tests** (`tests/integration/rabbit/` and `tests/integration/kafka/`) — validate
+    real broker behavior using [testcontainers-go](https://golang.testcontainers.org/)
 
 ---
 
@@ -30,15 +30,25 @@ Unit tests cover:
 ```bash
 make test-integration
 # or directly:
-go test -tags integration ./tests/integration/... -v -count=1 -timeout 120s
+go test -tags integration ./tests/integration/... -v -count=1 -timeout 240s
 ```
 
-Integration tests spin up a real RabbitMQ container via testcontainers-go automatically
-(requires Docker, Podman, or nerdctl). They cover:
+The RabbitMQ suite starts a real RabbitMQ container via testcontainers-go (requires Docker,
+Podman, or nerdctl). It covers:
 - Domain event fan-out (`events_test.go`)
 - Command point-to-point delivery (`commands_test.go`)
 - Async query request/reply round-trip (`queries_test.go`)
 - Notification non-durable broadcast (`notifications_test.go`)
+
+The Kafka suite under `tests/integration/kafka/` starts Kafka test containers and covers command
+and event retries/DLQs, query round-trips and error replies, notification fan-out, and Java raw-
+client envelope interoperability. Run it independently with:
+
+```bash
+go test -tags integration ./tests/integration/kafka/... -v -count=1 -timeout 240s
+```
+
+Both integration suites require a working container runtime.
 
 ### Run Everything
 
@@ -48,7 +58,8 @@ make test
 
 ### Point at an Existing Broker
 
-If you already have RabbitMQ running (e.g., in CI), skip the testcontainer startup:
+If you already have RabbitMQ running (e.g., in CI), point the RabbitMQ integration suite at it
+instead of starting its test container:
 
 ```bash
 RABBITMQ_HOST=localhost RABBITMQ_PORT=5672 \
@@ -64,7 +75,7 @@ Integration tests use the build tag `//go:build integration` so they are exclude
 
 ```bash
 go test ./...                          # unit tests only
-go test -tags integration ./...        # unit + integration
+go test -tags integration ./tests/integration/... -timeout 240s
 ```
 
 ---
@@ -139,7 +150,8 @@ func TestHandleGetProduct(t *testing.T) {
 
 ## Writing Integration Tests
 
-Integration tests use a shared RabbitMQ fixture set up in `TestMain`. The standard pattern is:
+RabbitMQ integration tests use a shared broker fixture set up in `TestMain`. The standard
+RabbitMQ test pattern is:
 
 ```go
 //go:build integration
@@ -240,7 +252,8 @@ go test -tags integration ./tests/integration/... \
 go tool cover -func coverage.out
 ```
 
-The target coverage for `internal/rabbit/` is ≥ 70%.
+This example measures `internal/rabbit/`; Kafka coverage is not included in that `-coverpkg`
+pattern.
 
 ---
 
@@ -268,13 +281,12 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.22'
-      - name: Integration tests (testcontainers pulls RabbitMQ automatically)
-        run: |
-          go test -tags integration ./tests/integration/... -v -count=1 -timeout 120s
+            - name: Integration tests (testcontainers starts both brokers)
+                run: go test -tags integration ./tests/integration/... -v -count=1 -timeout 240s
 ```
 
-No separate RabbitMQ service definition is needed — testcontainers-go pulls the image and
-starts the broker automatically when Docker is available on the runner.
+No separate broker service definition is needed — testcontainers-go pulls the images and starts
+RabbitMQ and Kafka automatically when Docker is available on the runner.
 
 ---
 

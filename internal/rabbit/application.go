@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/bancolombia/reactive-commons-go/internal/replyrouter"
 	"github.com/bancolombia/reactive-commons-go/internal/utils"
 	"github.com/bancolombia/reactive-commons-go/pkg/async"
 )
@@ -87,7 +88,7 @@ func (a *RabbitApp) Start(ctx context.Context) error {
 	}
 
 	gw := newGateway(sender, a.cfg)
-	replyRouter := NewReplyRouter()
+	replyRouter := replyrouter.NewReplyRouter()
 	gw.withReplySupport(a.replyQueueName, replyRouter)
 
 	a.replyL = newReplyListener(conn, replyRouter, a.cfg, &a.shutdownWg)

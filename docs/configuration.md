@@ -1,7 +1,12 @@
-# Configuration Reference
+# RabbitMQ Configuration Reference
 
-All configuration is provided via `rabbit.RabbitConfig` — a plain Go struct with no hidden
-global state. Use `rabbit.NewConfigWithDefaults()` to start from sensible defaults and
+This reference covers `rabbit.RabbitConfig`, the configuration for the RabbitMQ backend. Kafka
+uses a separate `kafka.KafkaConfig`; do not pass RabbitMQ exchange, queue, or persistence options
+to the Kafka constructor. See [kafka.md](kafka.md#configuration) for Kafka fields and topic
+provisioning.
+
+All RabbitMQ configuration is provided via `rabbit.RabbitConfig` — a plain Go struct with no
+hidden global state. Use `rabbit.NewConfigWithDefaults()` to start from sensible defaults and
 override only what you need.
 
 ---
@@ -188,7 +193,8 @@ When `WithDLQRetry` is enabled the topology mirrors reactive-commons-java:
 
 ## Environment Variable Pattern
 
-There is no built-in env-var loading; you wire it yourself:
+The following example is RabbitMQ-specific; there is no built-in env-var loading, so wire it
+yourself:
 
 ```go
 func configFromEnv() rabbit.RabbitConfig {
