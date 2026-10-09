@@ -1,75 +1,19 @@
 package kafka
 
 import (
-	"crypto/tls"
 	"fmt"
 	"log/slog"
 	"time"
 
+	ikafka "github.com/bancolombia/reactive-commons-go/internal/kafka"
 	"github.com/google/uuid"
 	kgo "github.com/segmentio/kafka-go"
-	"github.com/segmentio/kafka-go/sasl"
-	"go.opentelemetry.io/otel/metric"
-	"go.opentelemetry.io/otel/trace"
 )
 
 // KafkaConfig configures a Kafka-backed reactive-commons Application.
 // See specs/001-kafka-broker-support/data-model.md for field-level defaults
-// and semantics.
-type KafkaConfig struct {
-	AppName          string
-	BootstrapBrokers []string
-	ClientID         string
-	InstanceID       string
-
-	TLS  *tls.Config
-	SASL sasl.Mechanism
-
-	TopicNameFunc             func(name string) string
-	NotificationTopicNameFunc func(name string) string
-	// CommandsTopicNameFunc derives the commands topic for an application.
-	// The listener calls it with this app's name; the gateway calls it with
-	// the target service name. Defaults to appName+".commands".
-	CommandsTopicNameFunc func(appName string) string
-	// QueriesTopicNameFunc derives the async-queries topic for an application,
-	// with the same caller contract as CommandsTopicNameFunc. Defaults to
-	// appName+".queries".
-	QueriesTopicNameFunc func(appName string) string
-	// RepliesTopicNameFunc derives this app's reply topic (where query
-	// responders publish). Defaults to appName+".replies".
-	RepliesTopicNameFunc func(appName string) string
-	ConsumerGroupPrefix  string
-
-	// DisableReplyListener skips reply-topic verification and the reply
-	// consumer at Start. Set it for apps that never call RequestReply; doing
-	// so makes RequestReply return an error and removes the {app}.replies
-	// topic requirement.
-	DisableReplyListener bool
-
-	ProducerAcks         kgo.RequiredAcks
-	ProducerBatchTimeout time.Duration
-	ProducerCompression  kgo.Compression
-	MaxMessageBytes      int
-
-	HandlerTimeout    time.Duration
-	MaxRetryAttempts  int
-	RetryInitialDelay time.Duration
-	RetryMaxDelay     time.Duration
-	DLQSuffix         string
-
-	AllowAutoCreateTopics    bool
-	DefaultPartitions        int
-	DefaultReplicationFactor int
-
-	ConsumerSessionTimeout    time.Duration
-	ConsumerHeartbeatInterval time.Duration
-
-	AutoGenerateMissingEventID bool
-
-	Logger        *slog.Logger
-	Tracer        trace.Tracer
-	MeterProvider metric.MeterProvider
-}
+// and semantics. The internal Kafka config is the canonical field layout.
+type KafkaConfig ikafka.Config
 
 // NewConfigWithDefaults returns a KafkaConfig with production-safe defaults.
 // Callers MUST set AppName and BootstrapBrokers before use.
