@@ -26,17 +26,8 @@ func newNotificationListener(conn *Connection, reg *handlerRegistry, cfg Config,
 	l := &notificationListener{reg: reg, cfg: cfg, log: cfg.Logger}
 	l.sup = newSupervisedConsumer(conn, cfg.Logger, wg, "notification",
 		func(queueName string) (consumerChannel, <-chan amqp.Delivery, error) {
-			ch, err := conn.Channel()
-			if err != nil {
-				return nil, nil, err
-			}
 			// Auto-ack and exclusive: fan-out temp queue, one per app instance.
-			deliveries, err := ch.Consume(queueName, "", true, true, false, false, nil)
-			if err != nil {
-				_ = ch.Close()
-				return nil, nil, err
-			}
-			return ch, deliveries, nil
+			return openConsumerChannel(conn, 0, queueName, true, true)
 		},
 		l.dispatch, ensureTopology)
 	return l
@@ -49,32 +40,22 @@ func (l *notificationListener) Start(ctx context.Context, queueName string) erro
 }
 
 func (l *notificationListener) dispatch(ctx context.Context, d amqp.Delivery) {
-	defer func() {
-		if r := recover(); r != nil {
-			l.log.Error("reactive-commons: panic in notification handler", "panic", r)
-			// Notifications are non-durable — no redeliver on error.
-		}
-	}()
+	dispatchEnvelope(l.log, "notification", false, d, nil,
+		func(env *async.RawEnvelope) {
+			handler := l.reg.NotificationHandler(env.Name)
+			if handler == nil {
+				return
+			}
 
-	var env async.RawEnvelope
-	if err := json.Unmarshal(d.Body, &env); err != nil {
-		l.log.Error("reactive-commons: failed to deserialize notification envelope", "error", err)
-		return
-	}
+			n := async.Notification[any]{
+				Name:    env.Name,
+				EventID: env.EventID,
+				Data:    json.RawMessage(env.Data),
+			}
 
-	handler := l.reg.NotificationHandler(env.Name)
-	if handler == nil {
-		return
-	}
-
-	n := async.Notification[any]{
-		Name:    env.Name,
-		EventID: env.EventID,
-		Data:    json.RawMessage(env.Data),
-	}
-
-	if err := handler(ctx, n); err != nil {
-		l.log.Error("reactive-commons: notification handler error", "notification", env.Name, "error", err)
-		// No redeliver — notification delivery is best-effort.
-	}
+			if err := handler(ctx, n); err != nil {
+				l.log.Error("reactive-commons: notification handler error", "notification", env.Name, "error", err)
+				// No redeliver — notification delivery is best-effort.
+			}
+		})
 }

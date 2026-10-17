@@ -25,17 +25,8 @@ func newReplyListener(conn *Connection, router *replyrouter.ReplyRouter, cfg Con
 	l := &replyListener{router: router, cfg: cfg, log: cfg.Logger}
 	l.sup = newSupervisedConsumer(conn, cfg.Logger, wg, "reply",
 		func(queueName string) (consumerChannel, <-chan amqp.Delivery, error) {
-			ch, err := conn.Channel()
-			if err != nil {
-				return nil, nil, err
-			}
 			// Auto-ack and exclusive: this is a per-instance ephemeral reply queue.
-			deliveries, err := ch.Consume(queueName, "", true, true, false, false, nil)
-			if err != nil {
-				_ = ch.Close()
-				return nil, nil, err
-			}
-			return ch, deliveries, nil
+			return openConsumerChannel(conn, 0, queueName, true, true)
 		},
 		func(_ context.Context, d amqp.Delivery) { l.route(d) },
 		ensureTopology)

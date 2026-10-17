@@ -27,20 +27,7 @@ func newQueryListener(conn *Connection, reg *handlerRegistry, gw *gateway, cfg C
 	l := &queryListener{reg: reg, gw: gw, cfg: cfg, log: cfg.Logger}
 	l.sup = newSupervisedConsumer(conn, cfg.Logger, wg, "query",
 		func(queueName string) (consumerChannel, <-chan amqp.Delivery, error) {
-			ch, err := conn.Channel()
-			if err != nil {
-				return nil, nil, err
-			}
-			if err = ch.Qos(cfg.PrefetchCount, 0, false); err != nil {
-				_ = ch.Close()
-				return nil, nil, err
-			}
-			deliveries, err := ch.Consume(queueName, "", false, false, false, false, nil)
-			if err != nil {
-				_ = ch.Close()
-				return nil, nil, err
-			}
-			return ch, deliveries, nil
+			return openConsumerChannel(conn, cfg.PrefetchCount, queueName, false, false)
 		},
 		l.dispatch, ensureTopology)
 	return l
@@ -55,49 +42,41 @@ func (l *queryListener) Start(ctx context.Context, queueName string) error {
 func (l *queryListener) dispatch(ctx context.Context, d amqp.Delivery) {
 	requeueOnFailure := !l.cfg.WithDLQRetry
 
-	defer func() {
-		if r := recover(); r != nil {
-			l.log.Error("reactive-commons: panic in query handler", "panic", r)
-			_ = d.Nack(false, requeueOnFailure)
-		}
-	}()
+	dispatchEnvelope(l.log, "query", requeueOnFailure, d,
+		func(requeue bool) { _ = d.Nack(false, requeue) },
+		func(env *async.RawEnvelope) {
+			from := async.From{
+				CorrelationID: headerString(d.Headers, hdr.CorrelationID),
+				ReplyID:       headerString(d.Headers, hdr.ReplyID),
+			}
 
-	var env async.RawEnvelope
-	if err := json.Unmarshal(d.Body, &env); err != nil {
-		l.log.Error("reactive-commons: failed to deserialize query envelope", "error", err)
-		_ = d.Nack(false, false)
-		return
-	}
+			handler := l.reg.QueryHandler(env.Resource)
+			if handler == nil {
+				_ = d.Ack(false)
+				return
+			}
 
-	from := async.From{
-		CorrelationID: headerString(d.Headers, hdr.CorrelationID),
-		ReplyID:       headerString(d.Headers, hdr.ReplyID),
-	}
+			query := async.AsyncQuery[any]{
+				Resource:  env.Resource,
+				QueryData: json.RawMessage(env.QueryData),
+			}
 
-	handler := l.reg.QueryHandler(env.Resource)
-	if handler == nil {
-		_ = d.Ack(false)
-		return
-	}
+			result, err := handler(ctx, query, from)
+			if err != nil {
+				// Handler errors are answered to the caller, not redelivered:
+				// the message is acked so it cannot loop.
+				if replyErr := l.gw.replyError(ctx, err.Error(), from); replyErr != nil {
+					l.log.Error("reactive-commons: failed to send error reply", "error", replyErr)
+				}
+				_ = d.Ack(false)
+				return
+			}
 
-	query := async.AsyncQuery[any]{
-		Resource:  env.Resource,
-		QueryData: json.RawMessage(env.QueryData),
-	}
-
-	result, err := handler(ctx, query, from)
-	if err != nil {
-		if replyErr := l.gw.replyError(ctx, err.Error(), from); replyErr != nil {
-			l.log.Error("reactive-commons: failed to send error reply", "error", replyErr)
-		}
-		_ = d.Ack(false)
-		return
-	}
-
-	if replyErr := l.gw.Reply(ctx, result, from); replyErr != nil {
-		l.log.Error("reactive-commons: failed to send query reply", "error", replyErr)
-	}
-	_ = d.Ack(false)
+			if replyErr := l.gw.Reply(ctx, result, from); replyErr != nil {
+				l.log.Error("reactive-commons: failed to send query reply", "error", replyErr)
+			}
+			_ = d.Ack(false)
+		})
 }
 
 // headerString extracts a string value from an AMQP header table.

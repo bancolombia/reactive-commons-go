@@ -25,20 +25,7 @@ func newEventListener(conn *Connection, reg *handlerRegistry, cfg Config, wg *sy
 	l := &eventListener{reg: reg, cfg: cfg, log: cfg.Logger}
 	l.sup = newSupervisedConsumer(conn, cfg.Logger, wg, "event",
 		func(queueName string) (consumerChannel, <-chan amqp.Delivery, error) {
-			ch, err := conn.Channel()
-			if err != nil {
-				return nil, nil, err
-			}
-			if err = ch.Qos(cfg.PrefetchCount, 0, false); err != nil {
-				_ = ch.Close()
-				return nil, nil, err
-			}
-			deliveries, err := ch.Consume(queueName, "", false, false, false, false, nil)
-			if err != nil {
-				_ = ch.Close()
-				return nil, nil, err
-			}
-			return ch, deliveries, nil
+			return openConsumerChannel(conn, cfg.PrefetchCount, queueName, false, false)
 		},
 		l.dispatch, ensureTopology)
 	return l
@@ -58,36 +45,13 @@ func (l *eventListener) dispatch(ctx context.Context, d amqp.Delivery) {
 	// declared in topology.go can do its job — matching reactive-commons-java.
 	requeueOnFailure := !l.cfg.WithDLQRetry
 
-	defer func() {
-		if r := recover(); r != nil {
-			l.log.Error("reactive-commons: panic in event handler", "panic", r)
-			_ = d.Nack(false, requeueOnFailure)
-		}
-	}()
-
-	var env async.RawEnvelope
-	if err := json.Unmarshal(d.Body, &env); err != nil {
-		l.log.Error("reactive-commons: failed to deserialize event envelope", "error", err)
-		_ = d.Nack(false, false)
-		return
-	}
-
-	handler := l.reg.EventHandler(env.Name)
-	if handler == nil {
-		_ = d.Ack(false)
-		return
-	}
-
-	event := async.DomainEvent[any]{
-		Name:    env.Name,
-		EventID: env.EventID,
-		Data:    json.RawMessage(env.Data),
-	}
-
-	if err := handler(ctx, event); err != nil {
-		l.log.Error("reactive-commons: event handler error", "event", env.Name, "error", err)
-		_ = d.Nack(false, requeueOnFailure)
-		return
-	}
-	_ = d.Ack(false)
+	dispatchEnvelope(l.log, "event", requeueOnFailure, d,
+		func(requeue bool) { _ = d.Nack(false, requeue) },
+		func(env *async.RawEnvelope) {
+			runEnvelopeHandler(l.log, "event", env.Name, requeueOnFailure, d, ctx, l.reg.EventHandler(env.Name), async.DomainEvent[any]{
+				Name:    env.Name,
+				EventID: env.EventID,
+				Data:    json.RawMessage(env.Data),
+			})
+		})
 }

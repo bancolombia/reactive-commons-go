@@ -23,6 +23,29 @@ type consumerChannel interface {
 // Consume. Used both for the initial channel and for every self-heal rebuild.
 type consumeOpen func(queueName string) (consumerChannel, <-chan amqp.Delivery, error)
 
+// openConsumerChannel opens a fresh channel for queueName and starts a
+// consumer on it. prefetch > 0 enables per-consumer QoS; autoAck and
+// exclusive pass through to Consume. Shared by all five listeners — their
+// channels differ only in these settings.
+func openConsumerChannel(conn *Connection, prefetch int, queueName string, autoAck, exclusive bool) (consumerChannel, <-chan amqp.Delivery, error) {
+	ch, err := conn.Channel()
+	if err != nil {
+		return nil, nil, err
+	}
+	if prefetch > 0 {
+		if err = ch.Qos(prefetch, 0, false); err != nil {
+			_ = ch.Close()
+			return nil, nil, err
+		}
+	}
+	deliveries, err := ch.Consume(queueName, "", autoAck, exclusive, false, false, nil)
+	if err != nil {
+		_ = ch.Close()
+		return nil, nil, err
+	}
+	return ch, deliveries, nil
+}
+
 // consumeDispatch handles one delivery (the listener-specific handler logic).
 type consumeDispatch func(ctx context.Context, d amqp.Delivery)
 

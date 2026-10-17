@@ -25,20 +25,7 @@ func newCommandListener(conn *Connection, reg *handlerRegistry, cfg Config, wg *
 	l := &commandListener{reg: reg, cfg: cfg, log: cfg.Logger}
 	l.sup = newSupervisedConsumer(conn, cfg.Logger, wg, "command",
 		func(queueName string) (consumerChannel, <-chan amqp.Delivery, error) {
-			ch, err := conn.Channel()
-			if err != nil {
-				return nil, nil, err
-			}
-			if err = ch.Qos(cfg.PrefetchCount, 0, false); err != nil {
-				_ = ch.Close()
-				return nil, nil, err
-			}
-			deliveries, err := ch.Consume(queueName, "", false, false, false, false, nil)
-			if err != nil {
-				_ = ch.Close()
-				return nil, nil, err
-			}
-			return ch, deliveries, nil
+			return openConsumerChannel(conn, cfg.PrefetchCount, queueName, false, false)
 		},
 		l.dispatch, ensureTopology)
 	return l
@@ -53,36 +40,13 @@ func (l *commandListener) Start(ctx context.Context, queueName string) error {
 func (l *commandListener) dispatch(ctx context.Context, d amqp.Delivery) {
 	requeueOnFailure := !l.cfg.WithDLQRetry
 
-	defer func() {
-		if r := recover(); r != nil {
-			l.log.Error("reactive-commons: panic in command handler", "panic", r)
-			_ = d.Nack(false, requeueOnFailure)
-		}
-	}()
-
-	var env async.RawEnvelope
-	if err := json.Unmarshal(d.Body, &env); err != nil {
-		l.log.Error("reactive-commons: failed to deserialize command envelope", "error", err)
-		_ = d.Nack(false, false)
-		return
-	}
-
-	handler := l.reg.CommandHandler(env.Name)
-	if handler == nil {
-		_ = d.Ack(false)
-		return
-	}
-
-	cmd := async.Command[any]{
-		Name:      env.Name,
-		CommandID: env.CommandID,
-		Data:      json.RawMessage(env.Data),
-	}
-
-	if err := handler(ctx, cmd); err != nil {
-		l.log.Error("reactive-commons: command handler error", "command", env.Name, "error", err)
-		_ = d.Nack(false, requeueOnFailure)
-		return
-	}
-	_ = d.Ack(false)
+	dispatchEnvelope(l.log, "command", requeueOnFailure, d,
+		func(requeue bool) { _ = d.Nack(false, requeue) },
+		func(env *async.RawEnvelope) {
+			runEnvelopeHandler(l.log, "command", env.Name, requeueOnFailure, d, ctx, l.reg.CommandHandler(env.Name), async.Command[any]{
+				Name:      env.Name,
+				CommandID: env.CommandID,
+				Data:      json.RawMessage(env.Data),
+			})
+		})
 }
