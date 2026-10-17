@@ -16,6 +16,13 @@ import (
 
 const publisherPoolSize = 4
 
+// Reconnect backoff schedule. Vars (not consts) so tests can shorten the
+// schedule without changing the production defaults.
+var (
+	reconnectInitialBackoff = 1 * time.Second
+	reconnectMaxBackoff     = 30 * time.Second
+)
+
 // modulePath is the Go module path used to look up the library's own version
 // from the consumer binary's build info.
 const modulePath = "github.com/bancolombia/reactive-commons-go"
@@ -86,7 +93,13 @@ type Connection struct {
 	pubPool [publisherPoolSize]*amqp.Channel
 	robin   atomic.Uint64
 
+	// stopped is set by Close and aborts any in-flight reconnectLoop.
+	stopped atomic.Bool
+
 	reconnectHooks []func()
+
+	// dialFn opens the AMQP connection; a test seam overriding amqp.DialConfig.
+	dialFn func(url string, cfg amqp.Config) (*amqp.Connection, error)
 }
 
 // NewConnection creates a new Connection using cfg but does not dial yet.
@@ -124,8 +137,13 @@ func (c *Connection) dialConfig() amqp.Config {
 // Dial establishes the AMQP connection and initialises the publisher channel pool.
 func (c *Connection) Dial() error {
 	url := c.dialURL()
+	c.stopped.Store(false)
 
-	conn, err := amqp.DialConfig(url, c.dialConfig())
+	dial := c.dialFn
+	if dial == nil {
+		dial = amqp.DialConfig
+	}
+	conn, err := dial(url, c.dialConfig())
 
 	if err != nil {
 		return fmt.Errorf("reactive-commons: dial %s:%d: %w", c.cfg.Host, c.cfg.Port, err)
@@ -179,6 +197,18 @@ func (c *Connection) PublisherChannel() *amqp.Channel {
 	return ch
 }
 
+// IsOpen reports whether the connection is established, not closed and not
+// stopped. Used by the Sender to decide whether a dead publisher channel can
+// be self-healed or must wait for the connection-level reconnect hook.
+func (c *Connection) IsOpen() bool {
+	if c.stopped.Load() {
+		return false
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.conn != nil && !c.conn.IsClosed()
+}
+
 // OnReconnect registers a hook to be called after a successful reconnection.
 func (c *Connection) OnReconnect(fn func()) {
 	c.mu.Lock()
@@ -186,8 +216,11 @@ func (c *Connection) OnReconnect(fn func()) {
 	c.mu.Unlock()
 }
 
-// Close gracefully closes all channels and the connection.
+// Close gracefully closes all channels and the connection. It also stops any
+// in-flight reconnectLoop, so a connection is never re-established after the
+// caller has shut the library down.
 func (c *Connection) Close() error {
+	c.stopped.Store(true)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for i, ch := range c.pubPool {
@@ -227,13 +260,26 @@ func (c *Connection) watchClose(url string) {
 }
 
 func (c *Connection) reconnectLoop(url string) {
-	backoff := 1 * time.Second
-	const maxBackoff = 30 * time.Second
+	backoff := reconnectInitialBackoff
+	maxBackoff := reconnectMaxBackoff
 	for {
+		if c.stopped.Load() {
+			// Close() aborted the reconnect; do not re-establish.
+			return
+		}
 		c.log.Info("reactive-commons: attempting reconnect", "delay", backoff)
 		time.Sleep(backoff)
 
-		conn, err := amqp.DialConfig(url, c.dialConfig())
+		if c.stopped.Load() {
+			// Close() arrived while waiting out the backoff.
+			return
+		}
+
+		dial := c.dialFn
+		if dial == nil {
+			dial = amqp.DialConfig
+		}
+		conn, err := dial(url, c.dialConfig())
 		if err != nil {
 			c.log.Warn("reactive-commons: reconnect failed", "error", err)
 			backoff = min(backoff*2, maxBackoff)
@@ -243,6 +289,13 @@ func (c *Connection) reconnectLoop(url string) {
 		c.mu.Lock()
 		c.conn = conn
 		c.mu.Unlock()
+
+		// Close() may have raced the successful dial: discard the fresh
+		// connection instead of leaving a zombie behind.
+		if c.stopped.Load() {
+			_ = conn.Close()
+			return
+		}
 
 		if err := c.initPublisherPool(); err != nil {
 			c.log.Error("reactive-commons: failed to init publisher pool after reconnect", "error", err)

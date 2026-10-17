@@ -84,7 +84,9 @@ func (g *gateway) RequestReply(ctx context.Context, query async.AsyncQuery[any],
 }
 
 // Reply sends the query response to the original caller identified by from.
-// Pass nil response to send a completion-only signal.
+// Pass nil response to send a completion-only signal. Replies use publisher
+// confirms so the send either reaches the broker or surfaces an error —
+// a silently lost reply would otherwise look like a caller timeout.
 func (g *gateway) Reply(ctx context.Context, response any, from async.From) error {
 	var body []byte
 	var err error
@@ -103,7 +105,7 @@ func (g *gateway) Reply(ctx context.Context, response any, from async.From) erro
 		}
 	}
 
-	return g.sender.SendNoConfirm(ctx, body, g.cfg.GlobalReplyExchange, from.ReplyID, headers, false)
+	return g.sender.SendWithConfirm(ctx, body, g.cfg.GlobalReplyExchange, from.ReplyID, headers, false)
 }
 
 // replyError sends an error reply to the caller (used by the query listener).
@@ -117,5 +119,5 @@ func (g *gateway) replyError(ctx context.Context, errMsg string, from async.From
 		hdr.ReplyError:        "true",
 		hdr.SourceApplication: g.cfg.AppName,
 	}
-	return g.sender.SendNoConfirm(ctx, body, g.cfg.GlobalReplyExchange, from.ReplyID, headers, false)
+	return g.sender.SendWithConfirm(ctx, body, g.cfg.GlobalReplyExchange, from.ReplyID, headers, false)
 }

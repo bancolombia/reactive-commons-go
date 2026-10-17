@@ -15,17 +15,47 @@ The library automatically reconnects to RabbitMQ when the broker connection drop
 1. The AMQP client detects a connection error (`amqp.ErrClosed` or similar network failure).
 2. The library waits using **exponential backoff**: 1 s → 2 s → 4 s → 8 s → … → 30 s cap.
 3. After re-establishing the connection, it:
+   - Rebuilds the publisher channel (before restarting consumers, so replies work
+     the instant a listener comes back)
    - Re-declares all exchanges and queues (topology is idempotent)
    - Restarts all consumer goroutines
+4. If re-declaring topology or restarting consumers fails, the library keeps
+   retrying with exponential backoff (1 s → 30 s cap) and logs every failed
+   attempt at ERROR level — a half-restored app must never look healthy.
+   Publishing stays available throughout, so messages queue broker-side and
+   are consumed once the consumers return.
 
 ### What Callers Experience
 
 | Component | Behaviour during outage |
 |-----------|------------------------|
-| `Emit` / `SendCommand` | Returns an error if the broker is unavailable during the publish |
-| `RequestReply` | Returns `ErrBrokerUnavailable` or context timeout |
-| Consumer goroutines | Paused; automatically resume after reconnect |
+| `Emit` / `SendCommand` | Returns `async.ErrBrokerUnavailable` promptly when the publish or its broker confirm fails (connection lost, channel closed by the broker, or broker nack) |
+| `RequestReply` | Returns `async.ErrBrokerUnavailable` if the send fails, `ErrQueryTimeout` if no reply arrives |
+| Consumer goroutines | Paused; automatically resume after reconnect (retrying if the topology cannot be restored immediately) |
 | In-flight messages at handler level | Message re-delivered by broker after reconnect (at-least-once) |
+
+### Sender Channel Self-Healing
+
+The publisher channel has its own failure path, independent of the connection:
+
+- When the broker closes the publisher channel (e.g. a 404 from publishing to
+  a missing exchange, or an operator action), every in-flight `SendWithConfirm`
+  waiter is released immediately with `async.ErrBrokerUnavailable` — callers
+  never block until their context expires.
+- If the connection is still healthy, the channel is rebuilt after a 1-second
+  pause. Publishing recovers without a connection drop; sends made during the
+  rebuild window fail fast with an error the caller can retry.
+- If the connection is down, the regular reconnect flow rebuilds the channel.
+
+`SendWithConfirm` is therefore *send-or-error*: every call either has the
+message confirmed by the broker or returns an error. The one documented
+exception is `EmitNotification`, which is fire-and-forget by design (a
+notification published while no listener is bound is a valid outcome). A
+notification that races a broker-initiated channel close can be lost, but the
+next send fails fast and the channel self-heals.
+
+Shutting the application down (`ctx` cancellation → `Close`) also aborts any
+in-flight reconnect attempt — no connection is re-established after shutdown.
 
 There is no configuration required — auto-reconnect is always active.
 
@@ -183,7 +213,7 @@ development).
 |------|-------------|
 | `async.ErrDuplicateHandler` | `ListenEvent`, `ListenCommand`, `ServeQuery`, or `ListenNotification` called twice for the same name |
 | `async.ErrQueryTimeout` | `RequestReply` context deadline exceeded before a response was received |
-| `async.ErrBrokerUnavailable` | Broker connection unavailable during a publish or subscribe operation |
+| `async.ErrBrokerUnavailable` | Publish failed or its broker confirm never arrived (connection or publisher channel lost, broker nack) — returned by `Emit`, `SendCommand`, `RequestReply`, and `Reply` |
 | `async.ErrDeserialize` | Incoming message body could not be unmarshaled into the handler's target type |
 
 ```go

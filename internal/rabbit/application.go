@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bancolombia/reactive-commons-go/internal/replyrouter"
@@ -39,6 +40,10 @@ type RabbitApp struct {
 	eventL *eventListener
 	cmdL   *commandListener
 	qL     *queryListener
+
+	// restoreGen is bumped by every reconnect hook invocation; a consumer
+	// restore retry loop exits when a newer generation supersedes it.
+	restoreGen uint64
 }
 
 // NewRabbitApp creates a new RabbitApp. Call Start to connect and begin processing.
@@ -124,9 +129,8 @@ func (a *RabbitApp) Start(ctx context.Context) error {
 	})
 	conn.OnReconnect(func() {
 		a.log.Info("reactive-commons: re-declaring topology and restarting consumers after reconnect")
-		if err := a.bringUpConsumers(ctx, conn); err != nil {
-			a.log.Error("reactive-commons: failed to restore consumers after reconnect", "error", err)
-		}
+		gen := atomic.AddUint64(&a.restoreGen, 1)
+		go a.restoreConsumers(ctx, conn, gen)
 	})
 
 	close(a.ready)
@@ -146,6 +150,45 @@ func (a *RabbitApp) Start(ctx context.Context) error {
 		a.log.Warn("reactive-commons: graceful shutdown timed out after 30s, forcing connection close")
 	}
 	return conn.Close()
+}
+
+// restoreConsumers keeps retrying bringUpConsumers with exponential backoff
+// until it succeeds, the app context is cancelled, or a newer reconnect
+// supersedes this attempt. Runs in its own goroutine so the reconnect hook
+// (and thus the watchClose handoff in reconnectLoop) is never blocked.
+// Publishing stays available throughout because the sender was rebuilt by the
+// earlier hook, so messages queue broker-side and are consumed once the
+// consumers return. Every failed attempt is logged at error level — a
+// half-restored app must not look healthy.
+func (a *RabbitApp) restoreConsumers(ctx context.Context, conn *Connection, gen uint64) {
+	restoreWithBackoff(ctx, gen, &a.restoreGen, a.log, func() error {
+		return a.bringUpConsumers(ctx, conn)
+	})
+}
+
+// restoreWithBackoff retries attempt with exponential backoff (1s → 30s cap)
+// until it succeeds or ctx is cancelled, and exits early when the restore
+// generation has moved on. Each failure is logged at error level.
+func restoreWithBackoff(ctx context.Context, gen uint64, current *uint64, log *slog.Logger, attempt func() error) {
+	backoff := 1 * time.Second
+	const maxBackoff = 30 * time.Second
+	for {
+		if atomic.LoadUint64(current) != gen {
+			return
+		}
+		if err := attempt(); err == nil {
+			log.Info("reactive-commons: consumers restored")
+			return
+		} else {
+			log.Error("reactive-commons: failed to restore consumers after reconnect; retrying", "error", err, "delay", backoff)
+		}
+		select {
+		case <-time.After(backoff):
+		case <-ctx.Done():
+			return
+		}
+		backoff = min(backoff*2, maxBackoff)
+	}
 }
 
 // bringUpConsumers (re)declares the consumer-side topology and starts every
