@@ -23,6 +23,7 @@ func TestRabbitConfig_WithDefaults_FillsAllZeroFields(t *testing.T) {
 	assert.Equal(t, "globalReply", cfg.GlobalReplyExchange)
 	assert.Equal(t, 250, cfg.PrefetchCount)
 	assert.Equal(t, 15*time.Second, cfg.ReplyTimeout)
+	assert.Equal(t, 30*time.Second, cfg.WriteTimeout)
 	assert.Equal(t, 1*time.Second, cfg.RetryDelay)
 	assert.Equal(t, "classic", cfg.QueueType)
 	assert.Equal(t, "svc", cfg.ConnectionName)
@@ -52,6 +53,7 @@ func TestRabbitConfig_WithDefaults_PreservesExplicitValues(t *testing.T) {
 		GlobalReplyExchange:    "rep",
 		PrefetchCount:          10,
 		ReplyTimeout:           5 * time.Second,
+		WriteTimeout:           10 * time.Second,
 		WithDLQRetry:           true,
 		RetryDelay:             3 * time.Second,
 		QueueType:              "quorum",
@@ -68,6 +70,7 @@ func TestRabbitConfig_WithDefaults_PreservesExplicitValues(t *testing.T) {
 	assert.Equal(t, "rep", cfg.GlobalReplyExchange)
 	assert.Equal(t, 10, cfg.PrefetchCount)
 	assert.Equal(t, 5*time.Second, cfg.ReplyTimeout)
+	assert.Equal(t, 10*time.Second, cfg.WriteTimeout)
 	assert.True(t, cfg.WithDLQRetry)
 	assert.Equal(t, 3*time.Second, cfg.RetryDelay)
 	assert.Equal(t, "quorum", cfg.QueueType)
@@ -96,7 +99,15 @@ func TestRabbitConfig_NewConfigWithDefaults_ReturnsCompleteDefaults(t *testing.T
 	assert.False(t, cfg.PersistentQueries)
 	assert.False(t, cfg.WithDLQRetry)
 	assert.Equal(t, "classic", cfg.QueueType)
+	assert.Equal(t, 30*time.Second, cfg.WriteTimeout)
 	assert.NotNil(t, cfg.Logger)
+}
+
+// A negative WriteTimeout disables the socket write deadline; WithDefaults must
+// preserve it instead of replacing it with the 30s default.
+func TestRabbitConfig_WithDefaults_PreservesNegativeWriteTimeout(t *testing.T) {
+	cfg := rabbit.RabbitConfig{AppName: "svc", WriteTimeout: -time.Second}.WithDefaults()
+	assert.Equal(t, -time.Second, cfg.WriteTimeout)
 }
 
 func TestRabbitConfig_Validate(t *testing.T) {

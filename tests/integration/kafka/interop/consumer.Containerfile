@@ -1,9 +1,8 @@
 FROM eclipse-temurin:21-jdk
 WORKDIR /app
 
-# The libs/ directory is pre-populated on the host before `container build`
-# runs (the build container has no DNS on Apple's container tool, so
-# fetching from Maven Central inside the build would fail).
+# The libs/ directory is pre-populated on the host before the testcontainers
+# Docker build runs, so the image build does not need Maven access.
 COPY libs /app/libs
 COPY Consumer.java /app/
 

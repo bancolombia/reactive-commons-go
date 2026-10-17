@@ -23,16 +23,11 @@ import (
 // consumer to resume within 60 s of broker restart without a process
 // restart, and (c) leave no goroutine leaks.
 //
-// Isolates itself in a dedicated Kafka container so the ambient broker is
-// untouched. Skips cleanly if Apple's `container` CLI is unavailable.
+// Isolates itself in a dedicated Kafka testcontainer so the shared broker is
+// untouched. Skips cleanly when no Docker-compatible provider is available.
 func TestRecovery_ProducerAndConsumerResume(t *testing.T) {
-	if !containerCLIAvailable(t) {
-		t.Skip("Apple `container` CLI not available; skipping recovery test")
-	}
-
-	containerName := "rc-recovery-" + strings.ReplaceAll(uuid.NewString(), "-", "")[:8]
-	brokerAddr := runKafkaContainer(t, containerName, randomBrokerPort())
-	brokers := []string{brokerAddr}
+	broker := runKafkaContainer(t, freePort(t))
+	brokers := []string{broker.Addr}
 
 	baselineGoroutines := runtime.NumGoroutine()
 
@@ -80,7 +75,7 @@ func TestRecovery_ProducerAndConsumerResume(t *testing.T) {
 		"handler should receive the pre-outage event")
 
 	// Step 2: kill the broker.
-	stopContainer(t, containerName)
+	broker.Stop(t)
 	// Give the broker's TCP listener time to fully go away.
 	time.Sleep(5 * time.Second)
 
@@ -96,10 +91,8 @@ func TestRecovery_ProducerAndConsumerResume(t *testing.T) {
 	require.Error(t, outageErr, "emit MUST fail while the broker is down")
 	assert.Contains(t, outageErr.Error(), "kafka:", "outage error must be wrapped with kafka: prefix")
 
-	// Step 3: bring the broker back.
-	startContainer(t, containerName)
-	require.NoError(t, waitBroker(brokerAddr, 45*time.Second),
-		"broker MUST become reachable within 45s of restart")
+	// Step 3: bring the broker back. Start waits for metadata to be served.
+	broker.Start(t)
 
 	// Step 4: emit again. The producer must resume without a process restart.
 	// Allow up to 60 s for reader + writer to reconnect and metadata to refresh.

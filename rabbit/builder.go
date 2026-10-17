@@ -57,6 +57,7 @@ func toInternalConfig(cfg RabbitConfig) irabbit.Config {
 		GlobalReplyExchange:    cfg.GlobalReplyExchange,
 		PrefetchCount:          cfg.PrefetchCount,
 		ReplyTimeout:           cfg.ReplyTimeout,
+		WriteTimeout:           cfg.WriteTimeout,
 		PersistentEvents:       cfg.PersistentEvents,
 		PersistentCommands:     cfg.PersistentCommands,
 		PersistentQueries:      cfg.PersistentQueries,

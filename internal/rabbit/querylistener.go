@@ -62,17 +62,25 @@ func (l *queryListener) dispatch(ctx context.Context, d amqp.Delivery) {
 			}
 
 			result, err := handler(ctx, query, from)
+
+			// Bound only the reply send: the handler above is user code and is
+			// not constrained by the caller's reply timeout. Without a bound,
+			// a lost confirm would wedge this consumer with the app-lifetime
+			// context.
+			replyCtx, cancelReply := l.gw.replyContext(ctx, d.Headers)
+			defer cancelReply()
+
 			if err != nil {
 				// Handler errors are answered to the caller, not redelivered:
 				// the message is acked so it cannot loop.
-				if replyErr := l.gw.replyError(ctx, err.Error(), from); replyErr != nil {
+				if replyErr := l.gw.replyError(replyCtx, err.Error(), from); replyErr != nil {
 					l.log.Error("reactive-commons: failed to send error reply", "error", replyErr)
 				}
 				_ = d.Ack(false)
 				return
 			}
 
-			if replyErr := l.gw.Reply(ctx, result, from); replyErr != nil {
+			if replyErr := l.gw.Reply(replyCtx, result, from); replyErr != nil {
 				l.log.Error("reactive-commons: failed to send query reply", "error", replyErr)
 			}
 			_ = d.Ack(false)

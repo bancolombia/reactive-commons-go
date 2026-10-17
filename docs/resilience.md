@@ -42,10 +42,25 @@ The publisher channel has its own failure path, independent of the connection:
   a missing exchange, or an operator action), every in-flight `SendWithConfirm`
   waiter is released immediately with `async.ErrBrokerUnavailable` — callers
   never block until their context expires.
-- If the connection is still healthy, the channel is rebuilt after a 1-second
-  pause. Publishing recovers without a connection drop; sends made during the
-  rebuild window fail fast with an error the caller can retry.
+- If the connection is still healthy, the channel is rebuilt with exponential
+  backoff (1 s → 30 s cap), **retrying until it succeeds** — a transient
+  rebuild failure cannot leave the sender permanently dead. Publishing
+  recovers without a connection drop; sends made during the rebuild window
+  fail fast with an error the caller can retry.
+- If the rebuild fails right after a connection-level reconnect, the sender
+  keeps retrying in the background the same way — publishing can never stay
+  broken until the *next* connection drop.
 - If the connection is down, the regular reconnect flow rebuilds the channel.
+- Sends are serialized through a context-aware publish slot: a send queued
+  behind a stalled publish (e.g. a wedged TCP write) returns at its own
+  context deadline instead of hanging on the broker's write.
+- Every socket write is bounded by `WriteTimeout` (default 30 s). amqp091
+  cannot interrupt an in-flight write when the caller's context is cancelled,
+  so without this bound a wedged TCP write could hold the publisher slot
+  indefinitely. When the write deadline fires, the connection is torn down and
+  the reconnect flow recovers. The send that was writing may wait up to
+  `WriteTimeout` even if its own context is shorter; sends queued behind it
+  honor their own contexts.
 
 `SendWithConfirm` is therefore *send-or-error*: every call either has the
 message confirmed by the broker or returns an error. The one documented
@@ -70,11 +85,52 @@ its own channel, mirroring the sender:
 - If the connection is down, the supervisor stays out of the way and the
   regular reconnect flow restores the consumer.
 - Starting a listener again (e.g. a reconnect restore racing a self-heal)
-  supersedes the previous supervisor, so two consumers can never be active on
-  the same queue at once.
+  supersedes the previous supervisor and waits for it to fully exit — closing
+  its channel and finishing any in-flight dispatch — before opening the new
+  consumer, so two consumers can never be active on the same queue at once.
+- The wait for a superseded supervisor is bounded (30 s). If a handler is still
+  running in dispatch, the replacement starts anyway and a WARN is logged. This
+  trades a possible duplicate delivery of one unacked message (already permitted
+  by at-least-once) for guaranteed recovery: a stuck handler can no longer keep
+  a consumer — and every listener started after it — down forever.
+- Every listener is attempted during a restore, even if another listener fails
+  to start; the errors are joined and the restore retry loop logs them.
 
 A consumer can therefore no longer die silently: either it recovers on its
 own, or every failed rebuild attempt is logged at ERROR level.
+
+### Live Health and Readiness
+
+`Ready()` is a **one-shot** signal: it closes when startup completes and never
+reopens during a later outage. Use `Health()` for live state:
+
+```go
+h := app.Health()
+if !h.Healthy {
+    log.Printf("degraded: connection=%s lastError=%q event=%s",
+        h.Connection.State, h.Connection.LastError, h.Consumers["event"].State)
+}
+```
+
+| Connection state | Meaning |
+|------------------|---------|
+| `idle` | Not started yet |
+| `connected` | AMQP connection is established |
+| `reconnecting` | Connection lost; connect attempts are running |
+| `stopped` | Application shut down (terminal) |
+
+| Consumer state | Meaning |
+|----------------|---------|
+| `running` | Consuming deliveries |
+| `rebuilding` | Channel is being opened/reopened |
+| `stopped` | Not consuming |
+
+`Healthy` is true only when the connection is `connected` and every configured
+consumer is `running`. The `Consumers` map is keyed by listener kind (`event`,
+`command`, `query`, `reply`, `notification`); `reply` is always present after
+startup, the others only when configured. `Health()` is a local snapshot, not a
+broker probe: states can change immediately after it returns, and a handler
+hung in dispatch still reports `running`.
 
 Shutting the application down (`ctx` cancellation → `Close`) also aborts any
 in-flight reconnect attempt — no connection is re-established after shutdown.
@@ -276,6 +332,7 @@ Log entries from the library use structured key-value pairs. Key fields to monit
 | Consumer channel lost / cancelled | ERROR | `listener`, `queue`, `error` / `consumerTag` |
 | Consumer channel rebuilt | INFO | `listener`, `queue` |
 | Failed consumer rebuild attempt | ERROR | `listener`, `queue`, `error`, `delay` |
+| Previous consumer still dispatching after supersede wait | WARN | `listener`, `queue`, `wait` |
 | Handler panic | ERROR | `pattern`, `name`, `panic`, `stack` |
 | Handler error (nack) | WARN | `pattern`, `name`, `error` |
 | Deserialize error | ERROR | `pattern`, `name`, `body`, `error` |

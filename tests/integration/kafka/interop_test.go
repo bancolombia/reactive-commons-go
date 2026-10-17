@@ -4,25 +4,29 @@ package kafka_test
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	rckafka "github.com/bancolombia/reactive-commons-go/kafka"
 	"github.com/bancolombia/reactive-commons-go/pkg/async"
 	"github.com/google/uuid"
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/testcontainers/testcontainers-go"
+	"github.com/testcontainers/testcontainers-go/network"
+	"github.com/testcontainers/testcontainers-go/wait"
 )
 
 // interopJars is the pinned dependency set that the Java sidecar links
-// against. The build container has no DNS under Apple's container tool, so
-// these are fetched on the host before `container build`.
+// against. They are fetched on the host before the image build so the build
+// does not need Maven access.
 var interopJars = []string{
 	"https://repo1.maven.org/maven2/org/apache/kafka/kafka-clients/3.9.0/kafka-clients-3.9.0.jar",
 	"https://repo1.maven.org/maven2/com/fasterxml/jackson/core/jackson-databind/2.16.1/jackson-databind-2.16.1.jar",
@@ -71,10 +75,53 @@ func fetchInteropJars(t *testing.T, interopDir string) {
 }
 
 const (
-	interopKafkaImage    = "rc-interop-kafka:latest"
-	interopConsumerImage = "rc-interop-consumer:latest"
-	interopKafkaHostPort = 19094
+	interopKafkaImageRepo    = "rc-interop-kafka"
+	interopConsumerImageRepo = "rc-interop-consumer"
+	// interopHostListenerPort is Kafka's HOST listener inside the container;
+	// it is published to a free host port for the Go process.
+	interopHostListenerPort = 19094
 )
+
+// logCapture accumulates container output delivered by the testcontainers log
+// producer so assertions can wait for individual log lines.
+type logCapture struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (l *logCapture) Accept(log testcontainers.Log) {
+	l.mu.Lock()
+	l.buf.Write(log.Content)
+	l.mu.Unlock()
+}
+
+func (l *logCapture) contains(needle string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return strings.Contains(l.buf.String(), needle)
+}
+
+func (l *logCapture) tail(maxLines int) string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	lines := strings.Split(strings.TrimRight(l.buf.String(), "\n"), "\n")
+	if len(lines) > maxLines {
+		lines = lines[len(lines)-maxLines:]
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (l *logCapture) waitFor(needle string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if l.contains(needle) {
+			return nil
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return fmt.Errorf("did not observe log line matching %q within %s; last logs:\n%s",
+		needle, timeout, l.tail(40))
+}
 
 // TestInterop_JavaConsumerReadsGoEmits covers T059 / SC-005: a Java consumer
 // built against kafka-clients + jackson (proxying for io.cloudevents parsing)
@@ -82,52 +129,95 @@ const (
 // payload and for a CloudEvent-shaped payload nested in the envelope's data
 // field.
 //
-// Skips on `-short` (task marks this nightly-only) and when Apple's
-// `container` CLI is unavailable.
+// Skips on `-short` (nightly-only) and when no Docker-compatible provider is
+// available. Everything runs through testcontainers-go.
 func TestInterop_JavaConsumerReadsGoEmits(t *testing.T) {
 	if testing.Short() {
 		t.Skip("nightly interop")
 	}
-	if !containerCLIAvailable(t) {
-		t.Skip("Apple `container` CLI not available; skipping interop test")
-	}
+	testcontainers.SkipIfProviderIsNotHealthy(t)
 
+	ctx := context.Background()
 	interopDir, err := filepath.Abs("interop")
 	require.NoError(t, err)
 
-	// Step 1 — pre-fetch the Java dependencies on the host (build containers
-	// on Apple's `container` tool have no DNS), then build both images.
-	// Idempotent: `container build` caches layers and fetchInteropJars skips
-	// already-downloaded files.
+	// Fetch the Java dependencies on the host before the Docker build.
 	fetchInteropJars(t, interopDir)
-	buildImage(t, interopDir, "kafka.Containerfile", interopKafkaImage)
-	buildImage(t, interopDir, "consumer.Containerfile", interopConsumerImage)
 
-	// Step 2 — start Kafka. Publishes 19094:19094 for host access; internal
-	// listener is advertised on the container's own IP for the Java sidecar.
-	kafkaName := "rc-interop-kafka-" + strings.ReplaceAll(uuid.NewString(), "-", "")[:6]
-	runInteropKafka(t, kafkaName, interopKafkaHostPort)
-	kafkaIP := containerIPv4(t, kafkaName, 20*time.Second)
-	t.Logf("interop kafka: name=%s host=localhost:%d internal=%s:9092", kafkaName, interopKafkaHostPort, kafkaIP)
+	suffix := strings.ReplaceAll(uuid.NewString(), "-", "")[:6]
+	hostPort := freePort(t)
 
-	hostBroker := "localhost:" + itoa(interopKafkaHostPort)
+	dockerNet, err := network.New(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = dockerNet.Remove(context.Background()) })
+
+	// Kafka: reachable from the host on localhost:<hostPort> and from the Java
+	// sidecar on the network alias kafka:9092.
+	kafkaCtr, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+		ContainerRequest: testcontainers.ContainerRequest{
+			FromDockerfile: testcontainers.FromDockerfile{
+				Context:    interopDir,
+				Dockerfile: "kafka.Containerfile",
+				Repo:       interopKafkaImageRepo,
+				Tag:        "latest",
+				KeepImage:  true,
+			},
+			ExposedPorts: []string{strconv.Itoa(interopHostListenerPort) + "/tcp"},
+			HostConfigModifier: fixedHostPortBinding(hostPort,
+				strconv.Itoa(interopHostListenerPort)+"/tcp"),
+			Env:            map[string]string{"KAFKA_HOST_PORT": strconv.Itoa(hostPort)},
+			Networks:       []string{dockerNet.Name},
+			NetworkAliases: map[string][]string{dockerNet.Name: {"kafka"}},
+			WaitingFor: wait.ForListeningPort(strconv.Itoa(interopHostListenerPort) + "/tcp").
+				WithStartupTimeout(90 * time.Second),
+			Name: "rc-interop-kafka-" + suffix,
+		},
+		Started: true,
+	})
+	require.NoError(t, err, "start interop Kafka container")
+	t.Cleanup(func() { _ = kafkaCtr.Terminate(context.Background()) })
+
+	hostBroker := "localhost:" + strconv.Itoa(hostPort)
 	require.NoError(t, waitBroker(hostBroker, 60*time.Second),
 		"host-facing kafka MUST be reachable within 60s")
+	t.Logf("interop kafka: name=kafka host=%s internal=kafka:9092", hostBroker)
 
-	// Step 3 — create the two topics on the interop broker.
-	appName := "billing" + strings.ReplaceAll(uuid.NewString(), "-", "")[:6]
+	// Create the two topics on the interop broker.
+	appName := "billing" + suffix
 	plainTopic := appName + ".user.created"
 	ceTopic := appName + ".user.cloudevent"
 	createTopic(t, []string{hostBroker}, plainTopic, 1, 1)
 	createTopic(t, []string{hostBroker}, ceTopic, 1, 1)
 
-	// Step 4 — run the Java consumer sidecar, subscribing to both topics.
-	consumerName := "rc-interop-consumer-" + strings.ReplaceAll(uuid.NewString(), "-", "")[:6]
-	runJavaConsumer(t, consumerName, kafkaIP, plainTopic+","+ceTopic)
-	require.NoError(t, waitForLogLine(consumerName, "READY", 45*time.Second),
-		"Java consumer never printed READY; harness broken")
+	// Run the Java consumer sidecar, subscribing to both topics.
+	logs := &logCapture{}
+	consumerCtr, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+		ContainerRequest: testcontainers.ContainerRequest{
+			FromDockerfile: testcontainers.FromDockerfile{
+				Context:    interopDir,
+				Dockerfile: "consumer.Containerfile",
+				Repo:       interopConsumerImageRepo,
+				Tag:        "latest",
+				KeepImage:  true,
+			},
+			Env: map[string]string{
+				"KAFKA_BOOTSTRAP":  "kafka:9092",
+				"KAFKA_TOPICS":     plainTopic + "," + ceTopic,
+				"INTEROP_GROUP_ID": "interop-" + suffix,
+			},
+			Networks:   []string{dockerNet.Name},
+			WaitingFor: wait.ForLog("READY").WithStartupTimeout(90 * time.Second),
+			LogConsumerCfg: &testcontainers.LogConsumerConfig{
+				Consumers: []testcontainers.LogConsumer{logs},
+			},
+			Name: "rc-interop-consumer-" + suffix,
+		},
+		Started: true,
+	})
+	require.NoError(t, err, "start Java interop consumer")
+	t.Cleanup(func() { _ = consumerCtr.Terminate(context.Background()) })
 
-	// Step 5 — emit two events via the Go framework against the host port.
+	// Emit two events via the Go framework against the host port.
 	cfg := rckafka.NewConfigWithDefaults()
 	cfg.AppName = appName
 	cfg.BootstrapBrokers = []string{hostBroker}
@@ -138,9 +228,9 @@ func TestInterop_JavaConsumerReadsGoEmits(t *testing.T) {
 	app, err := rckafka.NewApplication(cfg)
 	require.NoError(t, err)
 
-	ctx, cancel := context.WithCancel(context.Background())
+	appCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go func() { _ = app.Start(ctx) }()
+	go func() { _ = app.Start(appCtx) }()
 	<-app.Ready()
 
 	plainID := uuid.NewString()
@@ -150,8 +240,8 @@ func TestInterop_JavaConsumerReadsGoEmits(t *testing.T) {
 		Data:    map[string]any{"userId": "u-plain"},
 	}))
 
-	// Second event: CloudEvent-in-data. Note we build the CloudEvent
-	// helper's map so we can capture its id for the assertion below.
+	// Second event: CloudEvent-in-data. Build the helper's map so we can
+	// capture its id for the assertion below.
 	ceHelper := rckafka.WrapAsCloudEvent("billing", "user.created", map[string]any{"userId": "u-ce"})
 	ceMap := ceHelper.(map[string]any)
 	ceID := ceMap["id"].(string)
@@ -163,92 +253,13 @@ func TestInterop_JavaConsumerReadsGoEmits(t *testing.T) {
 		Data:    ceHelper,
 	}))
 
-	// Step 6 — poll the Java container logs for two matching MSG lines.
 	plainNeedle := "MSG topic=" + plainTopic +
 		" name=user.created eventId=" + plainID + " ce.id=- ce.type=-"
 	ceNeedle := "MSG topic=" + ceTopic +
 		" name=user.cloudevent eventId=" + ceEventID + " ce.id=" + ceID + " ce.type=user.created"
 
-	require.NoError(t, waitForLogLine(consumerName, plainNeedle, 60*time.Second),
+	require.NoError(t, logs.waitFor(plainNeedle, 60*time.Second),
 		"Java consumer did not print the plain-payload MSG line")
-	require.NoError(t, waitForLogLine(consumerName, ceNeedle, 60*time.Second),
+	require.NoError(t, logs.waitFor(ceNeedle, 60*time.Second),
 		"Java consumer did not print the CloudEvent MSG line")
-
-	assert.True(t, true, "if we got here, both messages parsed round-trip in Java")
-}
-
-func buildImage(t *testing.T, contextDir, dockerfile, tag string) {
-	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "container", "build",
-		"-t", tag,
-		"-f", filepath.Join(contextDir, dockerfile),
-		contextDir)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("interop harness unavailable: build %s failed: %v\n%s", tag, err, out)
-	}
-}
-
-func runInteropKafka(t *testing.T, name string, hostPort int) {
-	t.Helper()
-	args := []string{
-		"run", "-d", "--name", name,
-		"-p", portMap(hostPort, 19094),
-		interopKafkaImage,
-	}
-	out, err := exec.Command("container", args...).CombinedOutput()
-	if err != nil {
-		t.Fatalf("interop harness unavailable: run kafka failed: %v\n%s", err, out)
-	}
-	t.Cleanup(func() {
-		_ = exec.Command("container", "stop", name).Run()
-		_ = exec.Command("container", "delete", name).Run()
-	})
-}
-
-func runJavaConsumer(t *testing.T, name, kafkaIP, topics string) {
-	t.Helper()
-	args := []string{
-		"run", "-d", "--name", name,
-		"-e", "KAFKA_BOOTSTRAP=" + kafkaIP + ":9092",
-		"-e", "KAFKA_TOPICS=" + topics,
-		"-e", "INTEROP_GROUP_ID=interop-" + name,
-		interopConsumerImage,
-	}
-	out, err := exec.Command("container", args...).CombinedOutput()
-	if err != nil {
-		t.Fatalf("interop harness unavailable: run consumer failed: %v\n%s", err, out)
-	}
-	t.Cleanup(func() {
-		_ = exec.Command("container", "stop", name).Run()
-		_ = exec.Command("container", "delete", name).Run()
-	})
-}
-
-// waitForLogLine polls `container logs` until the exact substring appears or
-// the deadline expires.
-func waitForLogLine(container, needle string, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		out, _ := exec.Command("container", "logs", container).CombinedOutput()
-		if strings.Contains(string(out), needle) {
-			return nil
-		}
-		time.Sleep(500 * time.Millisecond)
-	}
-	// Include tail of logs to aid debugging.
-	tail, _ := exec.Command("container", "logs", "-n", "40", container).CombinedOutput()
-	return &interopTimeoutError{needle: needle, timeout: timeout, tail: string(tail)}
-}
-
-type interopTimeoutError struct {
-	needle  string
-	timeout time.Duration
-	tail    string
-}
-
-func (e *interopTimeoutError) Error() string {
-	return "did not observe log line matching `" + e.needle + "` within " + e.timeout.String() + "; last logs:\n" + e.tail
 }

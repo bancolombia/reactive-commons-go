@@ -2,6 +2,7 @@ package rabbit
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sync"
 	"time"
@@ -70,17 +71,33 @@ type supervisedConsumer struct {
 	initialBackoff time.Duration
 	maxBackoff     time.Duration
 
-	// mu guards stop. start closes the previous supervisor's stop channel
-	// before swapping in a new one.
+	// supersedeWait bounds how long start waits for a superseded supervisor to
+	// finish its in-flight dispatch. A handler that does not return must not
+	// block consumer restoral forever.
+	supersedeWait time.Duration
+
+	// mu guards stop and done. start closes the previous supervisor's stop
+	// channel, swaps in the new pair, and waits for the previous done channel
+	// before opening a new consumer.
 	mu   sync.Mutex
 	stop chan struct{}
+	done chan struct{}
+
+	// stateMu guards the health snapshot and the supervisor generation. Every
+	// health update is tagged with a generation so a late-exiting superseded
+	// supervisor cannot mark a newer one stopped.
+	stateMu    sync.RWMutex
+	state      ConsumerState
+	stateSince time.Time
+	lastErr    string
+	runGen     uint64
 }
 
 func newSupervisedConsumer(conn *Connection, log *slog.Logger, wg *sync.WaitGroup, name string, open consumeOpen, dispatch consumeDispatch, ensureTopology func() error) *supervisedConsumer {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &supervisedConsumer{
+	c := &supervisedConsumer{
 		conn:           conn,
 		log:            log,
 		wg:             wg,
@@ -90,31 +107,89 @@ func newSupervisedConsumer(conn *Connection, log *slog.Logger, wg *sync.WaitGrou
 		ensureTopology: ensureTopology,
 		initialBackoff: 1 * time.Second,
 		maxBackoff:     30 * time.Second,
+		supersedeWait:  30 * time.Second,
+		state:          ConsumerStopped,
+		stateSince:     time.Now(),
 	}
+	return c
 }
 
 // start opens the first consumer channel and launches the supervisor goroutine.
 // It returns an error when the initial open fails, so the caller can retry with
 // its own backoff. Every start supersedes any previous supervisor: the old one
-// stops consuming on its next select iteration, before the new one is created.
+// is stopped and its exit is awaited before the new consumer is opened, so two
+// supervisors can never consume the same queue at once.
 func (c *supervisedConsumer) start(ctx context.Context, queueName string) error {
 	c.mu.Lock()
+	var prevDone <-chan struct{}
 	if c.stop != nil {
 		close(c.stop)
+		prevDone = c.done
 	}
 	stop := make(chan struct{})
-	c.stop = stop
+	done := make(chan struct{})
+	c.stop, c.done = stop, done
+
+	// Allocate the generation under the same lock that orders supersession, so
+	// concurrent starts cannot leave the older call owning the newest health
+	// generation. Lock order is mu -> stateMu; health snapshots take stateMu
+	// only.
+	c.stateMu.Lock()
+	c.runGen++
+	gen := c.runGen
+	c.setHealthLocked(ConsumerRebuilding, nil)
+	c.stateMu.Unlock()
 	c.mu.Unlock()
+
+	// Wait for the superseded supervisor to fully exit — closing its channel
+	// and finishing any in-flight dispatch — before opening the new consumer.
+	// Opening first would let the two briefly consume the same queue and
+	// double-process prefetched manual-ack messages. The wait is bounded: a
+	// handler that never returns must not prevent recovery; at-least-once
+	// semantics already permit the resulting duplicate delivery.
+	if prevDone != nil {
+		timer := time.NewTimer(c.supersedeWait)
+		select {
+		case <-prevDone:
+			timer.Stop()
+		case <-ctx.Done():
+			timer.Stop()
+			c.setHealthForGen(gen, ConsumerStopped, ctx.Err())
+			return ctx.Err()
+		case <-timer.C:
+			c.log.Warn("reactive-commons: previous consumer did not stop within supersede wait; starting a new consumer (possible duplicate delivery)",
+				"listener", c.name, "queue", queueName, "wait", c.supersedeWait)
+		}
+	}
 
 	ch, deliveries, err := c.open(queueName)
 	if err != nil {
+		c.setHealthForGen(gen, ConsumerStopped, err)
 		return err
+	}
+
+	// A newer start or shutdown may have superseded us while the channel was
+	// opening; do not launch a consumer nobody owns.
+	select {
+	case <-ctx.Done():
+		_ = ch.Close()
+		c.setHealthForGen(gen, ConsumerStopped, ctx.Err())
+		return ctx.Err()
+	case <-stop:
+		_ = ch.Close()
+		c.setHealthForGen(gen, ConsumerStopped, nil)
+		return nil
+	default:
 	}
 
 	if c.wg != nil {
 		c.wg.Add(1)
 	}
-	go c.supervise(ctx, queueName, stop, ch, deliveries)
+	// Mark running before launching so Health() is accurate the instant a
+	// caller observes a successful start (e.g. when Ready() closes). The
+	// supervisor re-affirms this on every channel.
+	c.setHealthForGen(gen, ConsumerRunning, nil)
+	go c.supervise(ctx, queueName, gen, stop, done, ch, deliveries)
 	return nil
 }
 
@@ -124,7 +199,12 @@ func (c *supervisedConsumer) start(ctx context.Context, queueName string) error 
 // with exponential backoff until success, ctx cancellation, or supersession.
 // Every failure is logged at error level — a half-restored listener must not
 // look healthy.
-func (c *supervisedConsumer) supervise(ctx context.Context, queueName string, stop chan struct{}, ch consumerChannel, deliveries <-chan amqp.Delivery) {
+func (c *supervisedConsumer) supervise(ctx context.Context, queueName string, gen uint64, stop, done chan struct{}, ch consumerChannel, deliveries <-chan amqp.Delivery) {
+	// Order matters: close(done) is registered before wg.Done so the wait in
+	// start observes the supervisor's exit only after the shutdown WaitGroup
+	// has been released.
+	defer close(done)
+	defer func() { c.setHealthForGen(gen, ConsumerStopped, ctx.Err()) }()
 	if c.wg != nil {
 		defer c.wg.Done()
 	}
@@ -133,12 +213,14 @@ func (c *supervisedConsumer) supervise(ctx context.Context, queueName string, st
 	for {
 		closes := ch.NotifyClose(make(chan *amqp.Error, 1))
 		cancels := ch.NotifyCancel(make(chan string, 1))
+		c.setHealthForGen(gen, ConsumerRunning, nil)
 
 		// logDeath describes how the current channel died. Emitted only when
 		// the connection is still healthy — on a connection drop the
 		// reconnect machinery logs the outage, so per-consumer lines would
 		// just duplicate it.
 		var logDeath func()
+		var deathReason string
 
 	consume:
 		for {
@@ -151,6 +233,7 @@ func (c *supervisedConsumer) supervise(ctx context.Context, queueName string, st
 				return
 			case d, ok := <-deliveries:
 				if !ok {
+					deathReason = "deliveries channel closed by broker"
 					logDeath = func() {
 						c.log.Error("reactive-commons: consumer deliveries channel closed by broker", "listener", c.name, "queue", queueName)
 					}
@@ -159,16 +242,22 @@ func (c *supervisedConsumer) supervise(ctx context.Context, queueName string, st
 				c.dispatch(ctx, d)
 			case err, ok := <-closes:
 				if ok && err != nil {
+					deathReason = err.Error()
 					logDeath = func() {
 						c.log.Error("reactive-commons: consumer channel closed by broker", "listener", c.name, "queue", queueName, "error", err)
 					}
+				} else if !ok {
+					deathReason = "channel close listener closed"
 				}
 				break consume
 			case tag, ok := <-cancels:
 				if ok {
+					deathReason = "consumer cancelled by broker: " + tag
 					logDeath = func() {
 						c.log.Error("reactive-commons: consumer cancelled by broker", "listener", c.name, "queue", queueName, "consumerTag", tag)
 					}
+				} else {
+					deathReason = "consumer cancel listener closed"
 				}
 				break consume
 			}
@@ -176,6 +265,9 @@ func (c *supervisedConsumer) supervise(ctx context.Context, queueName string, st
 
 		_ = ch.Close()
 
+		if deathReason != "" {
+			c.setHealthForGen(gen, ConsumerRebuilding, errors.New(deathReason))
+		}
 		if !c.conn.IsOpen() {
 			// The connection is down: the reconnect hook restarts consumers
 			// once it returns, so self-healing here would race it.
@@ -195,8 +287,18 @@ func (c *supervisedConsumer) supervise(ctx context.Context, queueName string, st
 			case <-time.After(backoff):
 			}
 
+			// A newer start may have superseded us while we slept. Bail out
+			// before opening another consumer; the start-side wait guarantees
+			// it, this check avoids the pointless open.
+			select {
+			case <-stop:
+				return
+			default:
+			}
+
 			if c.ensureTopology != nil {
 				if err := c.ensureTopology(); err != nil {
+					c.setHealthForGen(gen, ConsumerRebuilding, err)
 					c.log.Error("reactive-commons: failed to restore topology for consumer; retrying", "listener", c.name, "queue", queueName, "error", err, "delay", backoff)
 					backoff = min(backoff*2, c.maxBackoff)
 					continue
@@ -205,9 +307,19 @@ func (c *supervisedConsumer) supervise(ctx context.Context, queueName string, st
 
 			newCh, newDeliveries, err := c.open(queueName)
 			if err != nil {
+				c.setHealthForGen(gen, ConsumerRebuilding, err)
 				c.log.Error("reactive-commons: failed to rebuild consumer channel; retrying", "listener", c.name, "queue", queueName, "error", err, "delay", backoff)
 				backoff = min(backoff*2, c.maxBackoff)
 				continue
+			}
+
+			// Superseded while opening: close the fresh channel and let the
+			// new supervisor own the queue.
+			select {
+			case <-stop:
+				_ = newCh.Close()
+				return
+			default:
 			}
 
 			ch, deliveries = newCh, newDeliveries
@@ -215,4 +327,43 @@ func (c *supervisedConsumer) supervise(ctx context.Context, queueName string, st
 			break
 		}
 	}
+}
+
+// setHealthForGen records a health transition for the current supervisor only.
+// A superseded supervisor's late exit must not clobber its replacement's state.
+func (c *supervisedConsumer) setHealthForGen(gen uint64, state ConsumerState, err error) {
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	if c.runGen != gen {
+		return
+	}
+	c.setHealthLocked(state, err)
+}
+
+// setHealthLocked updates the snapshot. Caller must hold stateMu.
+func (c *supervisedConsumer) setHealthLocked(state ConsumerState, err error) {
+	if c.state != state {
+		c.state = state
+		c.stateSince = time.Now()
+	}
+	if err != nil {
+		c.lastErr = err.Error()
+	} else if state == ConsumerRunning {
+		c.lastErr = ""
+	}
+}
+
+// snapshot returns a copy of the consumer health.
+func (c *supervisedConsumer) snapshot() ConsumerHealth {
+	c.stateMu.RLock()
+	defer c.stateMu.RUnlock()
+	return ConsumerHealth{State: c.state, Since: c.stateSince, LastError: c.lastErr}
+}
+
+// markStopped forces the health state to stopped. Used at shutdown after the
+// supervisor drain, when a handler may still be running past the deadline.
+func (c *supervisedConsumer) markStopped() {
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	c.setHealthLocked(ConsumerStopped, nil)
 }

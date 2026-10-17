@@ -56,7 +56,9 @@ func main() {
 
 `Start` blocks until the context is cancelled, then performs a graceful shutdown
 (waits up to 30 s for in-flight handlers before closing the connection).
-Use `app.Ready()` to wait until topology setup and consumers are running.
+Use `app.Ready()` to wait until topology setup and consumers are running. `Ready()` is
+one-shot; for live readiness/liveness use `app.Health()`, which reports the connection
+and consumer states (see [docs/resilience.md](docs/resilience.md#live-health-and-readiness)).
 
 ---
 

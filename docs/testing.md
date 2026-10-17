@@ -40,15 +40,25 @@ Podman, or nerdctl). It covers:
 - Async query request/reply round-trip (`queries_test.go`)
 - Notification non-durable broadcast (`notifications_test.go`)
 
-The Kafka suite under `tests/integration/kafka/` starts Kafka test containers and covers command
-and event retries/DLQs, query round-trips and error replies, notification fan-out, and Java raw-
-client envelope interoperability. Run it independently with:
+The Kafka suite under `tests/integration/kafka/` starts a Kafka testcontainer and covers command
+and event retries/DLQs, query round-trips and error replies, notification fan-out, broker
+recovery (stop/start of a dedicated container), and Java raw-client envelope interoperability.
+Run it independently with:
 
 ```bash
-go test -tags integration ./tests/integration/kafka/... -v -count=1 -timeout 240s
+go test -tags integration ./tests/integration/kafka/... -v -count=1 -timeout 600s
 ```
 
-Both integration suites require a working container runtime.
+The Java interoperability test builds the sidecar images with testcontainers-go and is
+nightly-only; add `-short` to skip it during a regular integration run:
+
+```bash
+go test -tags integration -short ./tests/integration/kafka/...
+```
+
+Both integration suites require a Docker-compatible container runtime (Docker Desktop, Colima,
+OrbStack, Podman, or nerdctl) and use testcontainers-go to start their brokers. No Apple
+`container` CLI is used.
 
 ### Run Everything
 
@@ -282,7 +292,7 @@ jobs:
         with:
           go-version: '1.22'
             - name: Integration tests (testcontainers starts both brokers)
-                run: go test -tags integration ./tests/integration/... -v -count=1 -timeout 240s
+                run: go test -tags integration -short ./tests/integration/... -v -count=1 -timeout 600s
 ```
 
 No separate broker service definition is needed — testcontainers-go pulls the images and starts

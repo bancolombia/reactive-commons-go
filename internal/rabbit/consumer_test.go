@@ -168,6 +168,57 @@ func TestConsumer_SkipsSelfHealWhenConnectionDown(t *testing.T) {
 	assert.Equal(t, int64(1), opens.Load())
 }
 
+// TestConsumer_StartWaitsForSupersededSupervisorDispatch is the regression
+// test for the double-consume window: a superseded supervisor that is inside
+// a (possibly slow) dispatch cannot observe its stop channel, so a restart
+// that opened its consumer immediately would briefly consume the same queue
+// twice. start must wait for the superseded supervisor to fully exit.
+func TestConsumer_StartWaitsForSupersededSupervisorDispatch(t *testing.T) {
+	first := &fakeConsumerChannel{}
+	second := &fakeConsumerChannel{}
+	var opens atomic.Int64
+	deliveries := make(chan amqp.Delivery)
+	dispatchEntered := make(chan struct{})
+	releaseDispatch := make(chan struct{})
+	sup := newTestConsumer(openConn(), func(string) (consumerChannel, <-chan amqp.Delivery, error) {
+		if opens.Add(1) == 1 {
+			return first, deliveries, nil
+		}
+		return second, make(chan amqp.Delivery), nil
+	}, func(_ context.Context, d amqp.Delivery) {
+		close(dispatchEntered)
+		<-releaseDispatch
+	}, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	require.NoError(t, sup.start(ctx, "q"))
+
+	// Block the first supervisor inside dispatch: it cannot observe its stop
+	// channel until the handler returns.
+	deliveries <- amqp.Delivery{Body: []byte("block")}
+	<-dispatchEntered
+
+	startReturned := make(chan struct{})
+	go func() {
+		_ = sup.start(ctx, "q")
+		close(startReturned)
+	}()
+
+	// start must not open the second consumer while the superseded supervisor
+	// is still mid-dispatch.
+	time.Sleep(100 * time.Millisecond)
+	assert.Equal(t, int64(1), opens.Load(), "start opened a consumer while the superseded supervisor was mid-dispatch")
+
+	close(releaseDispatch)
+	select {
+	case <-startReturned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("start did not return after the superseded supervisor exited")
+	}
+	assert.Equal(t, int64(2), opens.Load())
+}
+
 // TestConsumer_StartSupersedesPreviousSupervisor guards double consumption: a
 // second start (e.g. a connection-level restore racing the self-heal) must
 // stop the previous supervisor before it can reopen its channel.
@@ -315,4 +366,117 @@ func TestConsumer_ContextCancelStopsSupervisor(t *testing.T) {
 
 	time.Sleep(200 * time.Millisecond)
 	assert.Equal(t, int64(1), opens.Load())
+}
+
+// TestConsumer_SupersedeWaitTimesOutAndProceeds: a handler stuck in dispatch
+// must not block a replacement consumer forever. After the bounded wait, start
+// proceeds and logs a warning.
+func TestConsumer_SupersedeWaitTimesOutAndProceeds(t *testing.T) {
+	first := &fakeConsumerChannel{}
+	second := &fakeConsumerChannel{}
+	deliveries := make(chan amqp.Delivery)
+	dispatchEntered := make(chan struct{})
+	releaseDispatch := make(chan struct{})
+	var opens atomic.Int64
+
+	sup := newTestConsumer(openConn(), func(string) (consumerChannel, <-chan amqp.Delivery, error) {
+		if opens.Add(1) == 1 {
+			return first, deliveries, nil
+		}
+		return second, make(chan amqp.Delivery), nil
+	}, func(context.Context, amqp.Delivery) {
+		close(dispatchEntered)
+		<-releaseDispatch
+	}, nil)
+	sup.supersedeWait = 50 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	require.NoError(t, sup.start(ctx, "q"))
+
+	deliveries <- amqp.Delivery{Body: []byte("block")}
+	<-dispatchEntered
+
+	startReturned := make(chan struct{})
+	go func() {
+		_ = sup.start(ctx, "q")
+		close(startReturned)
+	}()
+
+	select {
+	case <-startReturned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("start did not proceed after the supersede wait")
+	}
+	assert.Equal(t, int64(2), opens.Load())
+	close(releaseDispatch)
+}
+
+// TestConsumer_HealthTransitions covers running -> rebuilding (with error) ->
+// stopped across a broker channel kill and context cancellation.
+func TestConsumer_HealthTransitions(t *testing.T) {
+	first := &fakeConsumerChannel{}
+	openErr := errors.New("channel refused")
+	var opens atomic.Int64
+
+	sup := newTestConsumer(openConn(), func(string) (consumerChannel, <-chan amqp.Delivery, error) {
+		if opens.Add(1) == 1 {
+			return first, make(chan amqp.Delivery), nil
+		}
+		return nil, nil, openErr
+	}, func(context.Context, amqp.Delivery) {}, nil)
+	sup.initialBackoff = 100 * time.Millisecond
+	sup.maxBackoff = 100 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	require.NoError(t, sup.start(ctx, "q"))
+	require.Eventually(t, func() bool { return sup.snapshot().State == ConsumerRunning }, 2*time.Second, 5*time.Millisecond)
+
+	first.kill(t)
+	require.Eventually(t, func() bool {
+		s := sup.snapshot()
+		return s.State == ConsumerRebuilding && s.LastError != ""
+	}, 2*time.Second, 5*time.Millisecond)
+
+	cancel()
+	require.Eventually(t, func() bool { return sup.snapshot().State == ConsumerStopped }, 2*time.Second, 5*time.Millisecond)
+}
+
+// TestConsumer_HealthSupersededGenerationNotClobbered: a late exit from an old
+// supervisor must not mark the replacement stopped.
+func TestConsumer_HealthSupersededGenerationNotClobbered(t *testing.T) {
+	sup := newTestConsumer(openConn(), func(string) (consumerChannel, <-chan amqp.Delivery, error) {
+		return &fakeConsumerChannel{}, make(chan amqp.Delivery), nil
+	}, func(context.Context, amqp.Delivery) {}, nil)
+
+	sup.stateMu.Lock()
+	sup.runGen = 2
+	sup.setHealthLocked(ConsumerRunning, nil)
+	sup.stateMu.Unlock()
+
+	sup.setHealthForGen(1, ConsumerStopped, errors.New("stale exit"))
+
+	assert.Equal(t, ConsumerRunning, sup.snapshot().State)
+}
+
+// TestConsumer_StartAfterCtxCancelDoesNotLaunch: a shutdown racing the initial
+// open must close the fresh channel instead of launching a consumer.
+func TestConsumer_StartAfterCtxCancelDoesNotLaunch(t *testing.T) {
+	ch := &fakeConsumerChannel{}
+	var opens atomic.Int64
+	sup := newTestConsumer(openConn(), func(string) (consumerChannel, <-chan amqp.Delivery, error) {
+		opens.Add(1)
+		return ch, make(chan amqp.Delivery), nil
+	}, func(context.Context, amqp.Delivery) {}, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := sup.start(ctx, "q")
+
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Equal(t, int64(1), opens.Load())
+	assert.True(t, ch.closed.Load(), "fresh channel must be closed on a cancelled start")
+	assert.Equal(t, ConsumerStopped, sup.snapshot().State)
 }

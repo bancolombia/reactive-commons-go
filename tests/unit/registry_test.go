@@ -125,13 +125,14 @@ func TestConnection_OnReconnect_HookRegistered(t *testing.T) {
 	assert.False(t, called, "hook must not fire before reconnect occurs")
 }
 
-func TestConnection_PublisherChannel_ReturnsNilWhenUnconnected(t *testing.T) {
+func TestConnection_Channel_ErrNotConnectedBeforeDial(t *testing.T) {
 	conn := irabbit.NewConnection(irabbit.Config{
 		Host:   "localhost",
 		Port:   5672,
 		Logger: nil,
 	})
-	// The publisher pool is nil before Dial — PublisherChannel returns nil entry.
-	ch := conn.PublisherChannel()
-	assert.Nil(t, ch, "publisher channel must be nil when not connected")
+	// No connection exists before Dial — Channel reports ErrNotConnected.
+	ch, err := conn.Channel()
+	assert.Nil(t, ch)
+	assert.ErrorIs(t, err, irabbit.ErrNotConnected)
 }

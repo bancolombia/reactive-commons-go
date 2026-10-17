@@ -16,7 +16,7 @@ reply API, but uses topics and has different reply-delivery guarantees; see
 | Reply exchange | `globalReply` (topic, durable — matches reactive-commons-java) |
 | Reply routing key | `{caller}.replies.{uuid}` (unique per app instance) |
 | Reply queue | `{caller}.replies.{uuid}` (temp, auto-delete, exclusive) |
-| Default timeout | 15 seconds (configurable via `RabbitConfig.ReplyTimeout`) |
+| Default timeout | 15 seconds when the caller context has no deadline (configurable via `RabbitConfig.ReplyTimeout`) |
 | Caller blocks | Yes — `RequestReply` is synchronous from the caller's perspective |
 
 ## Kafka Behavior and Limitations
@@ -211,6 +211,11 @@ if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, async.ErrQueryTime
     log.Println("no response within 500ms")
 }
 ```
+
+If the caller passes a context without a deadline, `RabbitConfig.ReplyTimeout` (15 seconds
+by default) is applied. The same setting bounds the **server's reply publish** as well, so a
+reply whose broker confirm never arrives cannot wedge the query consumer. On the server side,
+the caller's `x-reply-timeout-millis` header takes precedence over the configured default.
 
 When a timeout fires:
 1. The caller's pending channel is removed from the reply router.

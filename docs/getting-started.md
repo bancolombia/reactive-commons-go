@@ -111,6 +111,11 @@ go func() {
 <-app.Ready() // blocks until topology is declared and consumers are running
 ```
 
+`Ready()` is a **one-shot** startup signal: it never reopens during a later broker outage or
+consumer rebuild. For live readiness/liveness — for example a Kubernetes probe — use
+`app.Health()`, which reports the connection state and every consumer's state. See
+[resilience.md](resilience.md#live-health-and-readiness).
+
 ---
 
 ## Your First Event (30-second example)
