@@ -31,7 +31,7 @@ The library automatically reconnects to RabbitMQ when the broker connection drop
 |-----------|------------------------|
 | `Emit` / `SendCommand` | Returns `async.ErrBrokerUnavailable` promptly when the publish or its broker confirm fails (connection lost, channel closed by the broker, or broker nack) |
 | `RequestReply` | Returns `async.ErrBrokerUnavailable` if the send fails, `ErrQueryTimeout` if no reply arrives |
-| Consumer goroutines | Paused; automatically resume after reconnect (retrying if the topology cannot be restored immediately) |
+| Consumer goroutines | Paused; automatically resume after reconnect or after a broker-initiated consumer cancel/channel close (retrying if the topology cannot be restored immediately) |
 | In-flight messages at handler level | Message re-delivered by broker after reconnect (at-least-once) |
 
 ### Sender Channel Self-Healing
@@ -53,6 +53,28 @@ exception is `EmitNotification`, which is fire-and-forget by design (a
 notification published while no listener is bound is a valid outcome). A
 notification that races a broker-initiated channel close can be lost, but the
 next send fails fast and the channel self-heals.
+
+### Consumer Channel Self-Healing
+
+Each consumer (events, commands, queries, replies, notifications) supervises
+its own channel, mirroring the sender:
+
+- When the broker closes a consumer's channel or cancels its consumer while
+  the connection is still healthy (e.g. an operator deletes the queue), the
+  listener logs the loss at ERROR level, re-declares topology, and rebuilds
+  the channel with exponential backoff (1 s → 30 s cap) — without dropping
+  the connection and without touching the other listeners.
+- Re-declaring topology on every rebuild attempt means a queue deleted while
+  the connection stayed up is recreated, so consumption resumes even though
+  the connection never dropped.
+- If the connection is down, the supervisor stays out of the way and the
+  regular reconnect flow restores the consumer.
+- Starting a listener again (e.g. a reconnect restore racing a self-heal)
+  supersedes the previous supervisor, so two consumers can never be active on
+  the same queue at once.
+
+A consumer can therefore no longer die silently: either it recovers on its
+own, or every failed rebuild attempt is logged at ERROR level.
 
 Shutting the application down (`ctx` cancellation → `Close`) also aborts any
 in-flight reconnect attempt — no connection is re-established after shutdown.
@@ -251,6 +273,9 @@ Log entries from the library use structured key-value pairs. Key fields to monit
 | Connection lost | WARN | `host`, `error` |
 | Reconnect attempt | INFO | `host`, `attempt`, `backoff` |
 | Reconnect success | INFO | `host` |
+| Consumer channel lost / cancelled | ERROR | `listener`, `queue`, `error` / `consumerTag` |
+| Consumer channel rebuilt | INFO | `listener`, `queue` |
+| Failed consumer rebuild attempt | ERROR | `listener`, `queue`, `error`, `delay` |
 | Handler panic | ERROR | `pattern`, `name`, `panic`, `stack` |
 | Handler error (nack) | WARN | `pattern`, `name`, `error` |
 | Deserialize error | ERROR | `pattern`, `name`, `body`, `error` |

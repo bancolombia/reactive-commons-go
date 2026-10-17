@@ -12,56 +12,44 @@ import (
 )
 
 type queryListener struct {
-	conn *Connection
-	reg  *handlerRegistry
-	gw   *gateway
-	cfg  Config
-	log  *slog.Logger
-	wg   *sync.WaitGroup
+	sup *supervisedConsumer
+	reg *handlerRegistry
+	gw  *gateway
+	cfg Config
+	log *slog.Logger
 }
 
-func newQueryListener(conn *Connection, reg *handlerRegistry, gw *gateway, cfg Config, wg *sync.WaitGroup) *queryListener {
-	return &queryListener{conn: conn, reg: reg, gw: gw, cfg: cfg, log: cfg.Logger, wg: wg}
-}
-
-// Start begins consuming from the queries queue. Returns when the consumer channel
-// is established; the goroutine runs until ctx is cancelled.
-func (l *queryListener) Start(ctx context.Context, queueName string) error {
-	ch, err := l.conn.Channel()
-	if err != nil {
-		return err
-	}
-	if err = ch.Qos(l.cfg.PrefetchCount, 0, false); err != nil {
-		_ = ch.Close()
-		return err
-	}
-	var deliveries <-chan amqp.Delivery
-	if deliveries, err = ch.Consume(queueName, "", false, false, false, false, nil); err != nil {
-		_ = ch.Close()
-		return err
-	}
-
-	if l.wg != nil {
-		l.wg.Add(1)
-	}
-	go func() {
-		defer func() { _ = ch.Close() }()
-		if l.wg != nil {
-			defer l.wg.Done()
-		}
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case d, ok := <-deliveries:
-				if !ok {
-					return
-				}
-				l.dispatch(ctx, d)
+// newQueryListener builds a query listener whose consumer channel is
+// supervised: a broker-initiated channel close or consumer cancel is healed
+// in place, while connection-level losses are restored by the application's
+// reconnect hook (which supersedes the previous supervisor via start).
+func newQueryListener(conn *Connection, reg *handlerRegistry, gw *gateway, cfg Config, wg *sync.WaitGroup, ensureTopology func() error) *queryListener {
+	l := &queryListener{reg: reg, gw: gw, cfg: cfg, log: cfg.Logger}
+	l.sup = newSupervisedConsumer(conn, cfg.Logger, wg, "query",
+		func(queueName string) (consumerChannel, <-chan amqp.Delivery, error) {
+			ch, err := conn.Channel()
+			if err != nil {
+				return nil, nil, err
 			}
-		}
-	}()
-	return nil
+			if err = ch.Qos(cfg.PrefetchCount, 0, false); err != nil {
+				_ = ch.Close()
+				return nil, nil, err
+			}
+			deliveries, err := ch.Consume(queueName, "", false, false, false, false, nil)
+			if err != nil {
+				_ = ch.Close()
+				return nil, nil, err
+			}
+			return ch, deliveries, nil
+		},
+		l.dispatch, ensureTopology)
+	return l
+}
+
+// Start begins consuming from the queries queue. Returns when the consumer
+// channel is established; the supervisor goroutine runs until ctx is cancelled.
+func (l *queryListener) Start(ctx context.Context, queueName string) error {
+	return l.sup.start(ctx, queueName)
 }
 
 func (l *queryListener) dispatch(ctx context.Context, d amqp.Delivery) {

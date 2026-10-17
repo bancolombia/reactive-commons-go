@@ -216,3 +216,170 @@ func TestResilience_CloseStopsReconnectLoop(t *testing.T) {
 		time.Sleep(250 * time.Millisecond)
 	}
 }
+
+// TestResilience_QueueDelete_SelfHealsConsumerWithoutConnectionDrop is the
+// consumer-side counterpart of SendFailsFastAndSelfHealsAfterChannelKill:
+// deleting the events queue cancels the consumer broker-side while the
+// connection stays up. The listener supervisor must re-declare the queue and
+// resume consuming without a connection-level reconnect. (RabbitMQ has no
+// broker-side "close one channel" operation — queue deletion is the operator
+// action that kills a consumer on a live connection.)
+func TestResilience_QueueDelete_SelfHealsConsumerWithoutConnectionDrop(t *testing.T) {
+	if rabbitMgmtPort == 0 {
+		t.Skip("management plugin not available; set RABBITMQ_MGMT_PORT or use a -management image")
+	}
+
+	ts := time.Now().UnixNano()
+	cfg := rabbit.NewConfigWithDefaults()
+	cfg.AppName = fmt.Sprintf("resil-chan-%d", ts)
+	cfg.ConnectionName = cfg.AppName
+	cfg.Host = rabbitHost
+	cfg.Port = rabbitPort
+
+	app, err := rabbit.NewApplication(cfg)
+	require.NoError(t, err)
+	received := make(chan string, 8)
+	require.NoError(t, app.Registry().ListenEvent("resil.chan.event", func(ctx context.Context, e async.DomainEvent[any]) error {
+		received <- e.EventID
+		return nil
+	}))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() { _ = app.Start(ctx) }()
+	select {
+	case <-app.Ready():
+	case <-time.After(30 * time.Second):
+		t.Fatal("app not ready")
+	}
+
+	require.NoError(t, app.EventBus().Emit(context.Background(), async.DomainEvent[any]{Name: "resil.chan.event", EventID: "before"}))
+	select {
+	case <-received:
+	case <-time.After(5 * time.Second):
+		t.Fatal("pre-delete event not received")
+	}
+
+	connRecord := connectionRecordName(t, cfg.AppName)
+
+	// Delete the events queue: the broker cancels the consumer (basic.cancel)
+	// without touching the connection.
+	require.NoError(t, deleteQueue(t, cfg.AppName+".subsEvents"))
+
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		emitErr := app.EventBus().Emit(context.Background(), async.DomainEvent[any]{Name: "resil.chan.event", EventID: "after"})
+		require.NoError(t, emitErr, "Emit must keep working while the consumer heals")
+		select {
+		case id := <-received:
+			assert.Equal(t, "after", id)
+			// The broker must still list the SAME connection record: a
+			// connection-level reconnect would have retired it.
+			assert.True(t, connectionRecordExists(t, connRecord), "consumer recovery must not drop the connection")
+			return
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+	t.Fatal("consumer never recovered after its queue was deleted")
+}
+
+// connectionRecordName returns the management API connection `name` (the
+// stable per-connection record identity) whose `connection_name` client
+// property matches appName.
+func connectionRecordName(t *testing.T, appName string) string {
+	t.Helper()
+	base := fmt.Sprintf("http://%s:%d", rabbitHost, rabbitMgmtPort)
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		req, err := http.NewRequest(http.MethodGet, base+"/api/connections", nil)
+		require.NoError(t, err)
+		req.SetBasicAuth("guest", "guest")
+		resp, err := client.Do(req)
+		require.NoError(t, err)
+		if resp.StatusCode != http.StatusOK {
+			_ = resp.Body.Close()
+			time.Sleep(200 * time.Millisecond)
+			continue
+		}
+		var conns []struct {
+			Name             string `json:"name"`
+			ClientProperties struct {
+				ConnectionName string `json:"connection_name"`
+			} `json:"client_properties"`
+		}
+		err = json.NewDecoder(resp.Body).Decode(&conns)
+		_ = resp.Body.Close()
+		require.NoError(t, err)
+		for _, c := range conns {
+			if c.ClientProperties.ConnectionName == appName {
+				return c.Name
+			}
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	t.Fatalf("connection with connection_name=%q not found in management API", appName)
+	return ""
+}
+
+// deleteQueue deletes queueName in the default vhost, waiting for it to
+// appear first — the management cache lags the queue declaration.
+func deleteQueue(t *testing.T, queueName string) error {
+	t.Helper()
+	base := fmt.Sprintf("http://%s:%d", rabbitHost, rabbitMgmtPort)
+	client := &http.Client{Timeout: 5 * time.Second}
+	// The default vhost "/" must be percent-encoded in the URL path.
+	delURL := base + "/api/queues/%2F/" + pathEscape(queueName)
+
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		req, err := http.NewRequest(http.MethodDelete, delURL, nil)
+		if err != nil {
+			return err
+		}
+		req.SetBasicAuth("guest", "guest")
+		resp, err := client.Do(req)
+		if err != nil {
+			return err
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusOK {
+			return nil
+		}
+		// 404 until the queue shows up in the management cache.
+		if resp.StatusCode != http.StatusNotFound {
+			return fmt.Errorf("management API DELETE queue returned %d", resp.StatusCode)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return fmt.Errorf("queue %q not found in management API", queueName)
+}
+
+// connectionRecordExists reports whether the management API still lists the
+// exact connection record name — a connection-level reconnect retires the
+// record, so its persistence proves the consumer healed without dropping.
+func connectionRecordExists(t *testing.T, connRecordName string) bool {
+	t.Helper()
+	base := fmt.Sprintf("http://%s:%d", rabbitHost, rabbitMgmtPort)
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	req, err := http.NewRequest(http.MethodGet, base+"/api/connections", nil)
+	require.NoError(t, err)
+	req.SetBasicAuth("guest", "guest")
+	resp, err := client.Do(req)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	var conns []struct {
+		Name string `json:"name"`
+	}
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&conns))
+	for _, c := range conns {
+		if c.Name == connRecordName {
+			return true
+		}
+	}
+	return false
+}

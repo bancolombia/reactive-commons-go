@@ -11,53 +11,41 @@ import (
 )
 
 type notificationListener struct {
-	conn *Connection
-	reg  *handlerRegistry
-	cfg  Config
-	log  *slog.Logger
-	wg   *sync.WaitGroup
+	sup *supervisedConsumer
+	reg *handlerRegistry
+	cfg Config
+	log *slog.Logger
 }
 
-func newNotificationListener(conn *Connection, reg *handlerRegistry, cfg Config, wg *sync.WaitGroup) *notificationListener {
-	return &notificationListener{conn: conn, reg: reg, cfg: cfg, log: cfg.Logger, wg: wg}
-}
-
-// Start declares an exclusive auto-delete temp queue, binds all registered
-// notification names, then begins consuming. The goroutine runs until ctx is cancelled.
-// Fan-out semantics: each app instance gets its own queue so every instance receives every notification.
-func (l *notificationListener) Start(ctx context.Context, queueName string) error {
-	ch, err := l.conn.Channel()
-	if err != nil {
-		return err
-	}
-
-	deliveries, err := ch.Consume(queueName, "", true, true, false, false, nil)
-	if err != nil {
-		_ = ch.Close()
-		return err
-	}
-
-	if l.wg != nil {
-		l.wg.Add(1)
-	}
-	go func() {
-		defer func() { _ = ch.Close() }()
-		if l.wg != nil {
-			defer l.wg.Done()
-		}
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case d, ok := <-deliveries:
-				if !ok {
-					return
-				}
-				l.dispatch(ctx, d)
+// newNotificationListener builds a notification listener whose consumer
+// channel is supervised: a broker-initiated channel close or consumer cancel
+// is healed in place, while connection-level losses are restored by the
+// application's reconnect hook (which supersedes the previous supervisor via
+// start).
+func newNotificationListener(conn *Connection, reg *handlerRegistry, cfg Config, wg *sync.WaitGroup, ensureTopology func() error) *notificationListener {
+	l := &notificationListener{reg: reg, cfg: cfg, log: cfg.Logger}
+	l.sup = newSupervisedConsumer(conn, cfg.Logger, wg, "notification",
+		func(queueName string) (consumerChannel, <-chan amqp.Delivery, error) {
+			ch, err := conn.Channel()
+			if err != nil {
+				return nil, nil, err
 			}
-		}
-	}()
-	return nil
+			// Auto-ack and exclusive: fan-out temp queue, one per app instance.
+			deliveries, err := ch.Consume(queueName, "", true, true, false, false, nil)
+			if err != nil {
+				_ = ch.Close()
+				return nil, nil, err
+			}
+			return ch, deliveries, nil
+		},
+		l.dispatch, ensureTopology)
+	return l
+}
+
+// Start begins consuming from the notification temp queue. The supervisor
+// goroutine runs until ctx is cancelled.
+func (l *notificationListener) Start(ctx context.Context, queueName string) error {
+	return l.sup.start(ctx, queueName)
 }
 
 func (l *notificationListener) dispatch(ctx context.Context, d amqp.Delivery) {
