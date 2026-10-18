@@ -37,15 +37,21 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	appErrCh := make(chan error, 1)
 	go func() {
-		if err := app.Start(ctx); err != nil {
-			logger.Error("application stopped with error", "err", err)
-		}
+		appErrCh <- app.Start(ctx)
 	}()
 
-	// Wait until the broker topology is ready before sending commands
-	<-app.Ready()
-	logger.Info("application ready, starting to send commands")
+	// Wait until the broker topology is ready before sending commands. Also
+	// watch for a startup failure so an unreachable broker does not block
+	// forever.
+	select {
+	case <-app.Ready():
+		logger.Info("application ready, starting to send commands")
+	case err := <-appErrCh:
+		logger.Error("application stopped before ready", "err", err)
+		return
+	}
 
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()

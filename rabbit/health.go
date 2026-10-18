@@ -34,16 +34,16 @@ const (
 
 // ConnectionHealth is a point-in-time snapshot of the AMQP connection.
 type ConnectionHealth struct {
-	State     ConnectionState
-	Since     time.Time
-	LastError string
+	State     ConnectionState `json:"state"`
+	Since     time.Time       `json:"since"`
+	LastError string          `json:"last_error,omitempty"`
 }
 
 // ConsumerHealth is a point-in-time snapshot of one supervised consumer.
 type ConsumerHealth struct {
-	State     ConsumerState
-	Since     time.Time
-	LastError string
+	State     ConsumerState `json:"state"`
+	Since     time.Time     `json:"since"`
+	LastError string        `json:"last_error,omitempty"`
 }
 
 // Health is a point-in-time snapshot of the application's connection and
@@ -54,13 +54,13 @@ type ConsumerHealth struct {
 // true when the connection is connected and every configured consumer is
 // running.
 type Health struct {
-	Ready      bool
-	Connection ConnectionHealth
+	Ready      bool             `json:"ready"`
+	Connection ConnectionHealth `json:"connection"`
 	// Consumers is keyed by listener kind: "event", "command", "query",
 	// "reply", and "notification". Only configured listeners are present;
 	// "reply" is always present after Start.
-	Consumers map[string]ConsumerHealth
-	Healthy   bool
+	Consumers map[string]ConsumerHealth `json:"consumers"`
+	Healthy   bool                      `json:"healthy"`
 }
 
 // Health returns a point-in-time snapshot of the connection and every

@@ -4,7 +4,7 @@
 // requests into reactive-commons calls — domain events, notifications,
 // commands, and async queries — all targeting `appName="receiver"`.
 //
-// Pair this sender with `examples/async-receiver-responder` (or the Java
+// Pair this sender with `examples/rabbitmq/async-receiver-responder` (or the Java
 // receiver) running against the same broker to see the end-to-end round-trip.
 //
 // Differences from the Java sample:

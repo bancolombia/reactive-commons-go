@@ -15,6 +15,6 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 FROM alpine:3.23
 USER root
 RUN addgroup -S app && adduser -S -G app app
-COPY --from=build /out/emitter /emitter
+COPY --from=builder /out/emitter /emitter
 USER app:app
 ENTRYPOINT ["/emitter"]

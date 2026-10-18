@@ -35,15 +35,21 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	appErrCh := make(chan error, 1)
 	go func() {
-		if err := app.Start(ctx); err != nil {
-			logger.Error("application stopped with error", "error", err)
-		}
+		appErrCh <- app.Start(ctx)
 	}()
 
-	// Wait until the broker topology is ready before sending commands
-	<-app.Ready()
-	logger.Info("application ready, starting to send commands")
+	// Wait until the broker topology is ready before sending commands. Also
+	// watch for a startup failure so an unreachable broker does not block
+	// forever.
+	select {
+	case <-app.Ready():
+		logger.Info("application ready, starting to send commands")
+	case err := <-appErrCh:
+		logger.Error("application stopped before ready", "error", err)
+		return
+	}
 
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
@@ -65,8 +71,12 @@ func main() {
 				Data:      invoiceData,
 			}
 
-			// "invoice-service" is the AppName of the target application
-			if err := app.Gateway().SendCommand(ctx, cmd, "invoice-service"); err != nil {
+			// "invoice-service" is the AppName of the target application.
+			// Bound each send: SendCommand waits for the broker confirm.
+			sendCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			err := app.Gateway().SendCommand(sendCtx, cmd, "invoice-service")
+			cancel()
+			if err != nil {
 				logger.Error("failed to send command", "error", err)
 				continue
 			}

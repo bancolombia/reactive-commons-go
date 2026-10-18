@@ -15,18 +15,18 @@ receiver) to see the full round-trip.
   commands actually have a counterpart:
 
   ```bash
-  go run ./examples/async-receiver-responder
+  go run ./examples/rabbitmq/async-receiver-responder
   ```
 
 ## Run
 
 ```bash
-go run ./examples/async-sender-client
+go run ./examples/rabbitmq/async-sender-client
 ```
 
 The HTTP server binds `:4001` (matching the Java sample's `server.port`). The
 example is split across `main.go`, `handlers.go`, and `model.go`, so use
-`go run ./examples/async-sender-client` (or `go run .` from inside the
+`go run ./examples/rabbitmq/async-sender-client` (or `go run .` from inside the
 directory) — `go run main.go` will not work.
 
 ## Endpoints
@@ -39,10 +39,17 @@ directory) — `go run main.go` will not work.
 | POST   | `/api/teams/{team}/members`                  | `Gateway().SendCommand(..., "receiver")`           | `add-member`               |
 | DELETE | `/api/teams/{team}/members/{member}`         | `EventBus().Emit(...)`                             | `member-removed`           |
 | GET    | `/api/animals/{event}`                       | `EventBus().Emit(...)`                             | `animals.{event}`          |
+| GET    | `/health`                                    | `Application.Health()` (no broker call)            | —                          |
 
 Each handler caps the broker call at a 10 s timeout; on failure it returns
-`500` (or `504` when the broker reply timed out) with a JSON error envelope
+`500`, `503` when the broker is unavailable (`async.ErrBrokerUnavailable`), or
+`504` when the broker reply timed out, with a JSON error envelope
 `{"error":"...","op":"..."}`.
+
+`/health` returns the live `Application.Health()` snapshot as JSON: `200` when
+the connection is connected and every configured consumer is running, `503`
+otherwise. Unlike the one-shot `Ready()` channel, it reflects reconnects and
+consumer rebuilds, so it is suitable for Kubernetes readiness/liveness probes.
 
 ## Sample requests
 
@@ -67,6 +74,9 @@ curl -X DELETE http://localhost:4001/api/teams
 # Trigger an animal event matching `animals.#`
 curl http://localhost:4001/api/animals/dogs
 curl http://localhost:4001/api/animals/cats.angry
+
+# Inspect live connection/consumer health (200 healthy, 503 degraded)
+curl -i http://localhost:4001/health
 ```
 
 ## Flow
@@ -99,7 +109,7 @@ hard-coded `:4001` listener address.
 We also enable `WithDLQRetry: true` and `QueueType: "quorum"` to match the
 [`async-receiver-responder`](../async-receiver-responder) example. Those
 arguments are immutable once a queue exists, so the sender's reply queue
-(`sender.{uuid}`) and the receiver's queues need to agree — otherwise
+(`sender.replies.{uuid}`) and the receiver's queues need to agree — otherwise
 RabbitMQ rejects redeclaration with `PRECONDITION_FAILED (406)`.
 
 ## Differences from the Java sample
@@ -115,8 +125,9 @@ RabbitMQ rejects redeclaration with `PRECONDITION_FAILED (406)`.
   `/api/animals/animals.dogs`); we make the URL friendlier
   (`/api/animals/dogs`) while still emitting `animals.dogs` on the wire so the
   receiver's `animals.#` binding matches.
-- **No actuator / Prometheus.** The Java config exposes `/actuator/health` and
-  `/actuator/prometheus`; this Go example sticks to the six business
-  endpoints. Add your own `net/http` middleware if you need observability.
+- **Minimal health, no Prometheus.** The Java config exposes
+  `/actuator/health` and `/actuator/prometheus`. This Go example exposes a
+  single `/health` endpoint backed by `Application.Health()`; add your own
+  metrics middleware if you need Prometheus.
 - **No external HTTP router.** The example uses stdlib `net/http` with Go
   1.22+ method+path patterns to avoid pulling in extra dependencies.
