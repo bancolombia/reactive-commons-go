@@ -12,104 +12,79 @@ import (
 )
 
 type queryListener struct {
-	conn *Connection
-	reg  *handlerRegistry
-	gw   *gateway
-	cfg  Config
-	log  *slog.Logger
-	wg   *sync.WaitGroup
+	sup *supervisedConsumer
+	reg *handlerRegistry
+	gw  *gateway
+	cfg Config
+	log *slog.Logger
 }
 
-func newQueryListener(conn *Connection, reg *handlerRegistry, gw *gateway, cfg Config, wg *sync.WaitGroup) *queryListener {
-	return &queryListener{conn: conn, reg: reg, gw: gw, cfg: cfg, log: cfg.Logger, wg: wg}
+// newQueryListener builds a query listener whose consumer channel is
+// supervised: a broker-initiated channel close or consumer cancel is healed
+// in place, while connection-level losses are restored by the application's
+// reconnect hook (which supersedes the previous supervisor via start).
+func newQueryListener(conn *Connection, reg *handlerRegistry, gw *gateway, cfg Config, wg *sync.WaitGroup, ensureTopology func() error) *queryListener {
+	l := &queryListener{reg: reg, gw: gw, cfg: cfg, log: cfg.Logger}
+	l.sup = newSupervisedConsumer(conn, cfg.Logger, wg, "query",
+		func(queueName string) (consumerChannel, <-chan amqp.Delivery, error) {
+			return openConsumerChannel(conn, cfg.PrefetchCount, queueName, false, false)
+		},
+		l.dispatch, ensureTopology)
+	return l
 }
 
-// Start begins consuming from the queries queue. Returns when the consumer channel
-// is established; the goroutine runs until ctx is cancelled.
+// Start begins consuming from the queries queue. Returns when the consumer
+// channel is established; the supervisor goroutine runs until ctx is cancelled.
 func (l *queryListener) Start(ctx context.Context, queueName string) error {
-	ch, err := l.conn.Channel()
-	if err != nil {
-		return err
-	}
-	if err = ch.Qos(l.cfg.PrefetchCount, 0, false); err != nil {
-		_ = ch.Close()
-		return err
-	}
-	var deliveries <-chan amqp.Delivery
-	if deliveries, err = ch.Consume(queueName, "", false, false, false, false, nil); err != nil {
-		_ = ch.Close()
-		return err
-	}
-
-	if l.wg != nil {
-		l.wg.Add(1)
-	}
-	go func() {
-		defer func() { _ = ch.Close() }()
-		if l.wg != nil {
-			defer l.wg.Done()
-		}
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case d, ok := <-deliveries:
-				if !ok {
-					return
-				}
-				l.dispatch(ctx, d)
-			}
-		}
-	}()
-	return nil
+	return l.sup.start(ctx, queueName)
 }
 
 func (l *queryListener) dispatch(ctx context.Context, d amqp.Delivery) {
 	requeueOnFailure := !l.cfg.WithDLQRetry
 
-	defer func() {
-		if r := recover(); r != nil {
-			l.log.Error("reactive-commons: panic in query handler", "panic", r)
-			_ = d.Nack(false, requeueOnFailure)
-		}
-	}()
+	dispatchEnvelope(l.log, "query", requeueOnFailure, d,
+		func(requeue bool) { _ = d.Nack(false, requeue) },
+		func(env *async.RawEnvelope) {
+			from := async.From{
+				CorrelationID: headerString(d.Headers, hdr.CorrelationID),
+				ReplyID:       headerString(d.Headers, hdr.ReplyID),
+			}
 
-	var env async.RawEnvelope
-	if err := json.Unmarshal(d.Body, &env); err != nil {
-		l.log.Error("reactive-commons: failed to deserialize query envelope", "error", err)
-		_ = d.Nack(false, false)
-		return
-	}
+			handler := l.reg.QueryHandler(env.Resource)
+			if handler == nil {
+				_ = d.Ack(false)
+				return
+			}
 
-	from := async.From{
-		CorrelationID: headerString(d.Headers, hdr.CorrelationID),
-		ReplyID:       headerString(d.Headers, hdr.ReplyID),
-	}
+			query := async.AsyncQuery[any]{
+				Resource:  env.Resource,
+				QueryData: json.RawMessage(env.QueryData),
+			}
 
-	handler := l.reg.QueryHandler(env.Resource)
-	if handler == nil {
-		_ = d.Ack(false)
-		return
-	}
+			result, err := handler(ctx, query, from)
 
-	query := async.AsyncQuery[any]{
-		Resource:  env.Resource,
-		QueryData: json.RawMessage(env.QueryData),
-	}
+			// Bound only the reply send: the handler above is user code and is
+			// not constrained by the caller's reply timeout. Without a bound,
+			// a lost confirm would wedge this consumer with the app-lifetime
+			// context.
+			replyCtx, cancelReply := l.gw.replyContext(ctx, d.Headers)
+			defer cancelReply()
 
-	result, err := handler(ctx, query, from)
-	if err != nil {
-		if replyErr := l.gw.replyError(ctx, err.Error(), from); replyErr != nil {
-			l.log.Error("reactive-commons: failed to send error reply", "error", replyErr)
-		}
-		_ = d.Ack(false)
-		return
-	}
+			if err != nil {
+				// Handler errors are answered to the caller, not redelivered:
+				// the message is acked so it cannot loop.
+				if replyErr := l.gw.replyError(replyCtx, err.Error(), from); replyErr != nil {
+					l.log.Error("reactive-commons: failed to send error reply", "error", replyErr)
+				}
+				_ = d.Ack(false)
+				return
+			}
 
-	if replyErr := l.gw.Reply(ctx, result, from); replyErr != nil {
-		l.log.Error("reactive-commons: failed to send query reply", "error", replyErr)
-	}
-	_ = d.Ack(false)
+			if replyErr := l.gw.Reply(replyCtx, result, from); replyErr != nil {
+				l.log.Error("reactive-commons: failed to send query reply", "error", replyErr)
+			}
+			_ = d.Ack(false)
+		})
 }
 
 // headerString extracts a string value from an AMQP header table.

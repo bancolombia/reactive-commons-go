@@ -11,52 +11,32 @@ import (
 )
 
 type replyListener struct {
-	conn   *Connection
+	sup    *supervisedConsumer
 	router *replyrouter.ReplyRouter
 	cfg    Config
 	log    *slog.Logger
-	wg     *sync.WaitGroup
 }
 
-func newReplyListener(conn *Connection, router *replyrouter.ReplyRouter, cfg Config, wg *sync.WaitGroup) *replyListener {
-	return &replyListener{conn: conn, router: router, cfg: cfg, log: cfg.Logger, wg: wg}
+// newReplyListener builds a reply listener whose consumer channel is
+// supervised: a broker-initiated channel close or consumer cancel is healed
+// in place, while connection-level losses are restored by the application's
+// reconnect hook (which supersedes the previous supervisor via start).
+func newReplyListener(conn *Connection, router *replyrouter.ReplyRouter, cfg Config, wg *sync.WaitGroup, ensureTopology func() error) *replyListener {
+	l := &replyListener{router: router, cfg: cfg, log: cfg.Logger}
+	l.sup = newSupervisedConsumer(conn, cfg.Logger, wg, "reply",
+		func(queueName string) (consumerChannel, <-chan amqp.Delivery, error) {
+			// Auto-ack and exclusive: this is a per-instance ephemeral reply queue.
+			return openConsumerChannel(conn, 0, queueName, true, true)
+		},
+		func(_ context.Context, d amqp.Delivery) { l.route(d) },
+		ensureTopology)
+	return l
 }
 
-// Start begins consuming from the reply queue. Replies are auto-acked (exclusive queue).
-// The goroutine runs until ctx is cancelled.
+// Start begins consuming from the reply queue. The supervisor goroutine runs
+// until ctx is cancelled.
 func (l *replyListener) Start(ctx context.Context, queueName string) error {
-	ch, err := l.conn.Channel()
-	if err != nil {
-		return err
-	}
-	// Auto-ack and exclusive: this is a per-instance ephemeral reply queue.
-	deliveries, err := ch.Consume(queueName, "", true, true, false, false, nil)
-	if err != nil {
-		_ = ch.Close()
-		return err
-	}
-
-	if l.wg != nil {
-		l.wg.Add(1)
-	}
-	go func() {
-		defer func() { _ = ch.Close() }()
-		if l.wg != nil {
-			defer l.wg.Done()
-		}
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case d, ok := <-deliveries:
-				if !ok {
-					return
-				}
-				l.route(d)
-			}
-		}
-	}()
-	return nil
+	return l.sup.start(ctx, queueName)
 }
 
 func (l *replyListener) route(d amqp.Delivery) {

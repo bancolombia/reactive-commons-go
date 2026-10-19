@@ -27,8 +27,13 @@ type Config struct {
 	DirectMessagesExchange string
 	GlobalReplyExchange    string
 
-	PrefetchCount      int
-	ReplyTimeout       time.Duration
+	PrefetchCount int
+	ReplyTimeout  time.Duration
+
+	// WriteTimeout bounds a single socket write to the broker. > 0 enables the
+	// per-write deadline; 0 or negative disables it (the public config resolves
+	// zero to its 30s default).
+	WriteTimeout       time.Duration
 	PersistentEvents   bool
 	PersistentCommands bool
 	PersistentQueries  bool

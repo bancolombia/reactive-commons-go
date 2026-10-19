@@ -11,90 +11,42 @@ import (
 )
 
 type commandListener struct {
-	conn *Connection
-	reg  *handlerRegistry
-	cfg  Config
-	log  *slog.Logger
-	wg   *sync.WaitGroup
+	sup *supervisedConsumer
+	reg *handlerRegistry
+	cfg Config
+	log *slog.Logger
 }
 
-func newCommandListener(conn *Connection, reg *handlerRegistry, cfg Config, wg *sync.WaitGroup) *commandListener {
-	return &commandListener{conn: conn, reg: reg, cfg: cfg, log: cfg.Logger, wg: wg}
+// newCommandListener builds a command listener whose consumer channel is
+// supervised: a broker-initiated channel close or consumer cancel is healed
+// in place, while connection-level losses are restored by the application's
+// reconnect hook (which supersedes the previous supervisor via start).
+func newCommandListener(conn *Connection, reg *handlerRegistry, cfg Config, wg *sync.WaitGroup, ensureTopology func() error) *commandListener {
+	l := &commandListener{reg: reg, cfg: cfg, log: cfg.Logger}
+	l.sup = newSupervisedConsumer(conn, cfg.Logger, wg, "command",
+		func(queueName string) (consumerChannel, <-chan amqp.Delivery, error) {
+			return openConsumerChannel(conn, cfg.PrefetchCount, queueName, false, false)
+		},
+		l.dispatch, ensureTopology)
+	return l
 }
 
-// Start begins consuming from the commands queue. Returns when the consumer channel
-// is established; the goroutine runs until ctx is cancelled.
+// Start begins consuming from the commands queue. Returns when the consumer
+// channel is established; the supervisor goroutine runs until ctx is cancelled.
 func (l *commandListener) Start(ctx context.Context, queueName string) error {
-	ch, err := l.conn.Channel()
-	if err != nil {
-		return err
-	}
-	if err = ch.Qos(l.cfg.PrefetchCount, 0, false); err != nil {
-		_ = ch.Close()
-		return err
-	}
-	var deliveries <-chan amqp.Delivery
-	if deliveries, err = ch.Consume(queueName, "", false, false, false, false, nil); err != nil {
-		_ = ch.Close()
-		return err
-	}
-
-	if l.wg != nil {
-		l.wg.Add(1)
-	}
-	go func() {
-		defer func() { _ = ch.Close() }()
-		if l.wg != nil {
-			defer l.wg.Done()
-		}
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case d, ok := <-deliveries:
-				if !ok {
-					return
-				}
-				l.dispatch(ctx, d)
-			}
-		}
-	}()
-	return nil
+	return l.sup.start(ctx, queueName)
 }
 
 func (l *commandListener) dispatch(ctx context.Context, d amqp.Delivery) {
 	requeueOnFailure := !l.cfg.WithDLQRetry
 
-	defer func() {
-		if r := recover(); r != nil {
-			l.log.Error("reactive-commons: panic in command handler", "panic", r)
-			_ = d.Nack(false, requeueOnFailure)
-		}
-	}()
-
-	var env async.RawEnvelope
-	if err := json.Unmarshal(d.Body, &env); err != nil {
-		l.log.Error("reactive-commons: failed to deserialize command envelope", "error", err)
-		_ = d.Nack(false, false)
-		return
-	}
-
-	handler := l.reg.CommandHandler(env.Name)
-	if handler == nil {
-		_ = d.Ack(false)
-		return
-	}
-
-	cmd := async.Command[any]{
-		Name:      env.Name,
-		CommandID: env.CommandID,
-		Data:      json.RawMessage(env.Data),
-	}
-
-	if err := handler(ctx, cmd); err != nil {
-		l.log.Error("reactive-commons: command handler error", "command", env.Name, "error", err)
-		_ = d.Nack(false, requeueOnFailure)
-		return
-	}
-	_ = d.Ack(false)
+	dispatchEnvelope(l.log, "command", requeueOnFailure, d,
+		func(requeue bool) { _ = d.Nack(false, requeue) },
+		func(env *async.RawEnvelope) {
+			runEnvelopeHandler(l.log, "command", env.Name, requeueOnFailure, d, ctx, l.reg.CommandHandler(env.Name), async.Command[any]{
+				Name:      env.Name,
+				CommandID: env.CommandID,
+				Data:      json.RawMessage(env.Data),
+			})
+		})
 }

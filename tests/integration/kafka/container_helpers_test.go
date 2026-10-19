@@ -4,88 +4,117 @@ package kafka_test
 
 import (
 	"context"
-	"encoding/json"
-	"log"
-	"os/exec"
-	"strings"
+	"net"
+	"net/netip"
+	"os"
+	"strconv"
 	"testing"
 	"time"
 
+	mobycontainer "github.com/moby/moby/api/types/container"
+	mobynetwork "github.com/moby/moby/api/types/network"
 	kgo "github.com/segmentio/kafka-go"
+	"github.com/stretchr/testify/require"
+	"github.com/testcontainers/testcontainers-go"
+	"github.com/testcontainers/testcontainers-go/wait"
 )
 
-// containerCLIAvailable reports whether Apple's `container` CLI is present on
-// PATH and its system services are running. Tests that manage container
-// lifecycles use this to skip cleanly on machines that don't have it.
-func containerCLIAvailable(t *testing.T) bool {
-	t.Helper()
-	if _, err := exec.LookPath("container"); err != nil {
-		return false
+const defaultKafkaTestImage = "apache/kafka:latest"
+
+// kafkaTestImage returns the Kafka image used by the testcontainers helpers.
+func kafkaTestImage() string {
+	if image := os.Getenv("TEST_KAFKA_IMAGE"); image != "" {
+		return image
 	}
-	// `container ls` should succeed when the system service is up.
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	return exec.CommandContext(ctx, "container", "ls").Run() == nil
+	return defaultKafkaTestImage
 }
 
-// runKafkaContainer starts a fresh KRaft-mode Kafka broker in a new container
-// listening on host port hostPort. Returns the broker address and a stop
-// function. The stop function is idempotent — you may call it during the
-// test to exercise the down-then-up path; it is also invoked from t.Cleanup
-// to guarantee cleanup on failure. Do NOT pass --rm; the recovery test needs
-// to stop and start the SAME container.
-func runKafkaContainer(t *testing.T, name string, hostPort int) string {
-	t.Helper()
-
-	args := []string{
-		"run", "-d", "--name", name,
-		"-p", portMap(hostPort, 9092),
-		"-e", "KAFKA_NODE_ID=1",
-		"-e", "KAFKA_PROCESS_ROLES=broker,controller",
-		"-e", "KAFKA_CONTROLLER_QUORUM_VOTERS=1@localhost:9093",
-		"-e", "KAFKA_LISTENERS=PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093",
-		"-e", "KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://localhost:" + itoa(hostPort),
-		"-e", "KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT",
-		"-e", "KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER",
-		"-e", "KAFKA_INTER_BROKER_LISTENER_NAME=PLAINTEXT",
-		"-e", "KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1",
-		"-e", "CLUSTER_ID=" + name,
-		"apache/kafka:latest",
+// kafkaKraftEnv configures a single-node KRaft broker reachable from the host
+// at localhost:<hostPort>.
+func kafkaKraftEnv(hostPort int) map[string]string {
+	return map[string]string{
+		"KAFKA_NODE_ID":                          "1",
+		"KAFKA_PROCESS_ROLES":                    "broker,controller",
+		"KAFKA_CONTROLLER_QUORUM_VOTERS":         "1@localhost:9093",
+		"KAFKA_LISTENERS":                        "PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093",
+		"KAFKA_ADVERTISED_LISTENERS":             "PLAINTEXT://localhost:" + strconv.Itoa(hostPort),
+		"KAFKA_LISTENER_SECURITY_PROTOCOL_MAP":   "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT",
+		"KAFKA_CONTROLLER_LISTENER_NAMES":        "CONTROLLER",
+		"KAFKA_INTER_BROKER_LISTENER_NAME":       "PLAINTEXT",
+		"KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR": "1",
 	}
-	out, err := exec.Command("container", args...).CombinedOutput()
-	if err != nil {
-		t.Fatalf("container run: %v\n%s", err, out)
-	}
+}
 
-	t.Cleanup(func() {
-		_ = exec.Command("container", "stop", name).Run()
-		_ = exec.Command("container", "delete", name).Run()
+// kafkaBrokerContainer owns a Kafka testcontainer whose published host port is
+// stable across Stop/Start, so a client can reconnect to the same address.
+type kafkaBrokerContainer struct {
+	Container testcontainers.Container
+	Addr      string
+}
+
+// fixedHostPortBinding publishes containerPort on a fixed host port. The fixed
+// mapping is required when the container's advertised address must contain the
+// host port before the container starts (Kafka's advertised listeners).
+func fixedHostPortBinding(hostPort int, containerPort string) func(*mobycontainer.HostConfig) {
+	port := mobynetwork.MustParsePort(containerPort)
+	return func(hc *mobycontainer.HostConfig) {
+		if hc.PortBindings == nil {
+			hc.PortBindings = mobynetwork.PortMap{}
+		}
+		hc.PortBindings[port] = []mobynetwork.PortBinding{{
+			HostIP:   netip.MustParseAddr("0.0.0.0"),
+			HostPort: strconv.Itoa(hostPort),
+		}}
+	}
+}
+
+// startKafkaBroker starts a single-node KRaft broker published on hostPort.
+func startKafkaBroker(ctx context.Context, hostPort int) (*kafkaBrokerContainer, error) {
+	ctr, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+		ContainerRequest: testcontainers.ContainerRequest{
+			Image:              kafkaTestImage(),
+			ExposedPorts:       []string{"9092/tcp"},
+			HostConfigModifier: fixedHostPortBinding(hostPort, "9092/tcp"),
+			Env:                kafkaKraftEnv(hostPort),
+			WaitingFor:         wait.ForListeningPort("9092/tcp").WithStartupTimeout(90 * time.Second),
+		},
+		Started: true,
 	})
-
-	addr := "localhost:" + itoa(hostPort)
-	if err := waitBroker(addr, 45*time.Second); err != nil {
-		t.Fatalf("Kafka container %s not ready: %v", name, err)
+	if err != nil {
+		return nil, err
 	}
-	log.Printf("Kafka broker started at %s", addr)
-	return addr
+	return &kafkaBrokerContainer{
+		Container: ctr,
+		Addr:      "localhost:" + strconv.Itoa(hostPort),
+	}, nil
 }
 
-func stopContainer(t *testing.T, name string) {
+// runKafkaContainer starts a dedicated Kafka broker for a test. The container
+// is terminated in Cleanup; tests may Stop and Start it in between.
+func runKafkaContainer(t *testing.T, hostPort int) *kafkaBrokerContainer {
 	t.Helper()
-	log.Printf("stoping container %s", name)
-	out, err := exec.Command("container", "stop", name).CombinedOutput()
-	if err != nil {
-		t.Fatalf("container stop %s: %v\n%s", name, err, out)
-	}
+	testcontainers.SkipIfProviderIsNotHealthy(t)
+
+	broker, err := startKafkaBroker(context.Background(), hostPort)
+	require.NoError(t, err, "start Kafka testcontainer")
+	t.Cleanup(func() { _ = broker.Container.Terminate(context.Background()) })
+
+	require.NoError(t, waitBroker(broker.Addr, 45*time.Second), "Kafka container not ready")
+	return broker
 }
 
-func startContainer(t *testing.T, name string) {
+// Stop stops the broker container, exercising the down path.
+func (b *kafkaBrokerContainer) Stop(t *testing.T) {
 	t.Helper()
-	log.Printf("starting container %s", name)
-	out, err := exec.Command("container", "start", name).CombinedOutput()
-	if err != nil {
-		t.Fatalf("container start %s: %v\n%s", name, err, out)
-	}
+	timeout := 30 * time.Second
+	require.NoError(t, b.Container.Stop(context.Background(), &timeout))
+}
+
+// Start restarts the same container and waits for the broker to serve metadata.
+func (b *kafkaBrokerContainer) Start(t *testing.T) {
+	t.Helper()
+	require.NoError(t, b.Container.Start(context.Background()))
+	require.NoError(t, waitBroker(b.Addr, 45*time.Second), "Kafka broker did not recover after restart")
 }
 
 // waitBroker polls addr until it accepts a TCP dial and returns Kafka
@@ -100,7 +129,7 @@ func waitBroker(addr string, timeout time.Duration) error {
 		if err == nil {
 			// Confirm the broker responds to metadata, not just TCP accept.
 			_, err = conn.ReadPartitions()
-			conn.Close()
+			_ = conn.Close()
 			if err == nil {
 				return nil
 			}
@@ -113,65 +142,23 @@ func waitBroker(addr string, timeout time.Duration) error {
 	return lastErr
 }
 
-// containerIPv4 returns the container's first IPv4 address in the default
-// network, stripped of any CIDR suffix. Retries until the network is
-// populated or the deadline elapses.
-func containerIPv4(t *testing.T, name string, timeout time.Duration) string {
+// freePort returns an unused local TCP port.
+func freePort(t *testing.T) int {
 	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		out, err := exec.Command("container", "inspect", name).CombinedOutput()
-		if err == nil {
-			// `container inspect` returns a JSON array; the assigned IP lives
-			// under status.networks[].ipv4Address as CIDR.
-			var docs []struct {
-				Status struct {
-					Networks []struct {
-						IPv4Address string `json:"ipv4Address"`
-					} `json:"networks"`
-				} `json:"status"`
-			}
-			if err := json.Unmarshal(out, &docs); err == nil && len(docs) > 0 {
-				for _, net := range docs[0].Status.Networks {
-					ip := net.IPv4Address
-					if slash := strings.IndexByte(ip, '/'); slash > 0 {
-						ip = ip[:slash]
-					}
-					if ip != "" {
-						return ip
-					}
-				}
-			}
-		}
-		time.Sleep(300 * time.Millisecond)
-	}
-	t.Fatalf("container %s never reported an ipv4 address within %s", name, timeout)
-	return ""
+	port, err := reserveFreePort()
+	require.NoError(t, err)
+	return port
 }
 
-func portMap(hostPort, containerPort int) string {
-	return itoa(hostPort) + ":" + itoa(containerPort)
-}
-
-func itoa(n int) string {
-	// Small inline itoa to avoid depending on strconv just for this file.
-	if n == 0 {
-		return "0"
+// reserveFreePort is freePort without a *testing.T, for TestMain.
+func reserveFreePort() (int, error) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return 0, err
 	}
-	neg := n < 0
-	if neg {
-		n = -n
+	port := l.Addr().(*net.TCPAddr).Port
+	if err := l.Close(); err != nil {
+		return 0, err
 	}
-	var buf [20]byte
-	i := len(buf)
-	for n > 0 {
-		i--
-		buf[i] = byte('0' + n%10)
-		n /= 10
-	}
-	if neg {
-		i--
-		buf[i] = '-'
-	}
-	return strings.Clone(string(buf[i:]))
+	return port, nil
 }

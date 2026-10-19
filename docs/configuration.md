@@ -162,7 +162,8 @@ zero-configuration interoperability with `reactive-commons-java`.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `PrefetchCount` | `int` | `250` | AMQP consumer prefetch (QoS). Higher values increase throughput but increase in-flight message count. |
-| `ReplyTimeout` | `time.Duration` | `15s` | Default timeout for `RequestReply` calls. Can be overridden per-call via `context.WithTimeout`. |
+| `ReplyTimeout` | `time.Duration` | `15s` | Default timeout for `RequestReply` when the caller context has no deadline. Also bounds the internal send of a query reply; the caller's `x-reply-timeout-millis` header takes precedence. Can be overridden per-call via `context.WithTimeout`. |
+| `WriteTimeout` | `time.Duration` | `30s` | Bounds a single socket write to the broker. A write that cannot make progress fails, the AMQP connection is torn down, and auto-reconnect recovers. Negative disables; `0` resolves to the default. |
 | `PersistentEvents` | `bool` | `true` | Publish domain events with delivery-mode 2 (persistent). Survives broker restart. |
 | `PersistentCommands` | `bool` | `true` | Publish commands with delivery-mode 2 (persistent). |
 | `PersistentQueries` | `bool` | `false` | Publish query requests with delivery-mode 2. Usually transient is fine. |
@@ -317,6 +318,7 @@ func buildConfig() rabbit.RabbitConfig {
         // Behaviour
         PrefetchCount:      500,              // higher throughput
         ReplyTimeout:       30 * time.Second, // lenient query timeout
+        WriteTimeout:       30 * time.Second, // bound a wedged socket write
         PersistentEvents:   true,
         PersistentCommands: true,
         PersistentQueries:  false,

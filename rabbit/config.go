@@ -32,8 +32,15 @@ type RabbitConfig struct {
 	GlobalReplyExchange    string // default: "globalReply"
 
 	// Behaviour
-	PrefetchCount      int           // default: 250
-	ReplyTimeout       time.Duration // default: 15s
+	PrefetchCount int // default: 250
+	// ReplyTimeout bounds RequestReply calls that have no deadline of their own,
+	// and the internal send of a query reply. Header x-reply-timeout-millis from
+	// the caller takes precedence on the reply path. Default: 15s.
+	ReplyTimeout time.Duration
+	// WriteTimeout bounds a single socket write to the broker. A write that
+	// cannot make progress within this window fails, the AMQP connection is torn
+	// down, and the reconnect flow recovers. Default: 30s. Negative disables.
+	WriteTimeout       time.Duration
 	PersistentEvents   bool          // default: true
 	PersistentCommands bool          // default: true
 	PersistentQueries  bool          // default: false
@@ -88,6 +95,9 @@ func (cfg RabbitConfig) WithDefaults() RabbitConfig {
 	if cfg.ReplyTimeout == 0 {
 		cfg.ReplyTimeout = 15 * time.Second
 	}
+	if cfg.WriteTimeout == 0 {
+		cfg.WriteTimeout = 30 * time.Second
+	}
 	if !cfg.WithDLQRetry || cfg.RetryDelay == 0 {
 		cfg.RetryDelay = 1 * time.Second
 	}
@@ -120,6 +130,7 @@ func NewConfigWithDefaults() RabbitConfig {
 		GlobalReplyExchange:    "globalReply",
 		PrefetchCount:          250,
 		ReplyTimeout:           15 * time.Second,
+		WriteTimeout:           30 * time.Second,
 		PersistentEvents:       true,
 		PersistentCommands:     true,
 		PersistentQueries:      false,

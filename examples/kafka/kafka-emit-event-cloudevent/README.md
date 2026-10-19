@@ -32,7 +32,7 @@ payload.
 
 ```sh
 export KAFKA_BOOTSTRAP=localhost:9092
-go run ./examples/kafka-emit-event-cloudevent
+go run ./examples/kafka/kafka-emit-event-cloudevent
 ```
 
 Verify from another shell:
@@ -41,5 +41,5 @@ Verify from another shell:
 kcat -b localhost:9092 -t billing.user.created -C -o beginning -e -q -J | jq .
 ```
 
-See [quickstart Scenario 7](../../specs/001-kafka-broker-support/quickstart.md)
-for the full recipe.
+See the [Kafka guide](../../../docs/kafka.md) for envelope, topic, and
+consumer semantics.

@@ -59,14 +59,18 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	appErrCh := make(chan error, 1)
 	go func() {
-		if err := app.Start(ctx); err != nil {
-			logger.Error("application stopped with error", "err", err)
-		}
+		appErrCh <- app.Start(ctx)
 	}()
 
-	<-app.Ready()
-	logger.Info("listening for commands, press Ctrl+C to stop", "topic", cfg.AppName+".commands")
+	select {
+	case <-app.Ready():
+		logger.Info("listening for commands, press Ctrl+C to stop", "topic", cfg.AppName+".commands")
+	case err := <-appErrCh:
+		logger.Error("application stopped before ready", "err", err)
+		return
+	}
 
 	<-ctx.Done()
 	logger.Info("shutting down")

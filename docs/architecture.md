@@ -31,9 +31,12 @@ reactive-commons-go/
 │
 ├── internal/rabbit/    # RabbitMQ implementation (not exported)
 │   ├── application.go  # RabbitApp — lifecycle coordinator
-│   ├── connection.go   # AMQP connection + channel pool + reconnect
+│   ├── connection.go   # AMQP connection + reconnect lifecycle
+│   ├── socket.go       # Bounded socket write deadlines
+│   ├── sender.go       # Publisher-confirm channel with self-healing
+│   ├── consumer.go     # Supervised consumer channel with self-healing
+│   ├── health.go       # Connection/consumer health snapshot
 │   ├── topology.go     # Exchange/queue declaration
-│   ├── sender.go       # Message publish (with/without confirm)
 │   ├── eventbus.go     # DomainEventBus implementation
 │   ├── gateway.go      # DirectAsyncGateway implementation
 │   ├── eventlistener.go       # Domain event consumer goroutine
@@ -109,7 +112,7 @@ does not make transport semantics identical; see [kafka-vs-rabbit.md](kafka-vs-r
 1. Dial AMQP connection (with context deadline)
 2. Open topology channel
 3. Declare exchanges:   domainEvents, directMessages, globalReply
-4. Create sender (publisher confirm channel pool)
+4. Create sender (single self-healing publisher-confirm channel)
 5. Create gateway (wraps sender)
 6. Declare + bind temp reply queue  {appName}.replies.{uuid}
 7. Register reconnect hook
@@ -135,16 +138,22 @@ topic during startup because a command or query target is only known when it is 
 
 ---
 
-## RabbitMQ Connection Pool
+## RabbitMQ Connection and Channels
 
 `Connection` maintains:
 
-- **1 AMQP connection** — shared across all channels
-- **4 publisher channels** — round-robin selection for concurrent publishes
-- **N consumer channels** — one per listener goroutine (consumers get dedicated channels)
+- **1 AMQP connection** — shared across all channels, watched for disconnects and re-established
+  with exponential backoff
+- **1 publisher channel** — owned by the Sender, in publisher-confirm mode; rebuilt in place when
+  the broker closes it and rebuilt after every connection reconnect
+- **N consumer channels** — one per listener supervisor; each heals its own channel when the
+  connection stays up, and is restarted by the reconnect hook when the connection drops
 
-The 4-channel publisher pool prevents the bottleneck of a single publish queue while staying
-within RabbitMQ's default per-connection channel limit.
+Publishes on the single confirm channel are serialized through a context-aware slot so delivery
+tags stay aligned with the broker's sequence, while confirm dispatch, channel-close draining, and
+channel rebuilds never hold the sender lock across broker RPCs. Every socket write is bounded by
+`WriteTimeout` (default 30 s) so a wedged TCP write fails the connection into the reconnect flow
+instead of stalling the publisher forever.
 
 ---
 
@@ -251,8 +260,9 @@ instance**. This ensures temporary queues are unique across restarts.
 | `HandlerRegistry` | Safe for concurrent reads after `Start()`; writes before `Start()` only |
 | `ReplyRouter` | Uses `sync.Map`; safe for concurrent register/route/deregister |
 | `RabbitApp.bus` / `.gw` | Protected by `sync.RWMutex`; set once during `Start()` |
-| Publisher channels | Round-robin pool; each channel used by one goroutine at a time |
-| Consumer goroutines | One per listener; sequential delivery within each |
+| `RabbitApp.Health()` | Snapshots are copied under per-component locks; safe to poll concurrently |
+| Publisher channel | Single confirm channel; publishes serialized by a context-aware slot, state guarded per sender |
+| Consumer goroutines | One supervisor per listener; sequential delivery within each |
 
 ---
 

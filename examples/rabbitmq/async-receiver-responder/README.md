@@ -24,7 +24,7 @@ Requires a running RabbitMQ at `localhost:5672` (guest/guest). From the repo
 root:
 
 ```bash
-go run ./examples/async-receiver-responder
+go run ./examples/rabbitmq/async-receiver-responder
 ```
 
 The example is split across multiple files (`main.go`, `handlers.go`,
@@ -64,9 +64,9 @@ receiver — start any of them in a second terminal:
 
 | Sender                               | Pattern this receiver handles |
 | ------------------------------------ | ----------------------------- |
-| [`examples/emit-event`](../emit-event)         | Domain events (`member-removed`, `animals.*`) |
-| [`examples/send-command`](../send-command)     | Commands (`add-member`)       |
-| [`examples/request-reply`](../request-reply)   | Queries (`get-teams`, `get-team-members`) |
+| [`examples/rabbitmq/emit-event`](../emit-event)         | Domain events (`member-removed`, `animals.*`) |
+| [`examples/rabbitmq/send-command`](../send-command)     | Commands (`add-member`)       |
+| [`examples/rabbitmq/request-reply`](../request-reply)   | Queries (`get-teams`, `get-team-members`) |
 
 You'll need to tweak the sender's routing keys, payloads, and target
 `AppName=receiver` to match this example's contract — they ship configured for

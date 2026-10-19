@@ -56,7 +56,9 @@ func main() {
 
 `Start` blocks until the context is cancelled, then performs a graceful shutdown
 (waits up to 30 s for in-flight handlers before closing the connection).
-Use `app.Ready()` to wait until topology setup and consumers are running.
+Use `app.Ready()` to wait until topology setup and consumers are running. `Ready()` is
+one-shot; for live readiness/liveness use `app.Health()`, which reports the connection
+and consumer states (see [docs/resilience.md](docs/resilience.md#live-health-and-readiness)).
 
 ---
 
@@ -178,6 +180,68 @@ Notifications use auto-delete exclusive queues — late-joining subscribers will
 
 ---
 
+## RabbitMQ Examples
+
+Runnable programs live under [`examples/rabbitmq/`](examples/rabbitmq/):
+
+- [`async-sender-client`](examples/rabbitmq/async-sender-client/) + [`async-receiver-responder`](examples/rabbitmq/async-receiver-responder/) — full REST request/reply, events, notifications, and a live `/health` endpoint.
+- [`emit-event`](examples/rabbitmq/emit-event/) / [`listen-event`](examples/rabbitmq/listen-event/) — domain event fan-out.
+- [`send-command`](examples/rabbitmq/send-command/) / [`listen-command`](examples/rabbitmq/listen-command/) — point-to-point commands.
+- [`request-reply`](examples/rabbitmq/request-reply/) / [`serve-query`](examples/rabbitmq/serve-query/) — async queries.
+- [`benchmark-emit-event`](examples/rabbitmq/benchmark-emit-event/) / [`benchmark-listen-event`](examples/rabbitmq/benchmark-listen-event/) — 5-minute throughput benchmarks for publishing and consuming domain events.
+
+### Throughput benchmarks
+
+The benchmark pair measures the domain-event path in isolation:
+`benchmark-emit-event` reports publish-confirm TPS, and `benchmark-listen-event`
+reports single-consumer dispatch TPS. Both run for 5 minutes by default and
+print the achieved TPS.
+
+Use a disposable local broker; the listener creates a durable queue per run and
+5 minutes of persistent events can consume significant disk:
+
+```bash
+docker run --rm -d --name rc-bench-rabbit -p 5672:5672 -p 15672:15672 rabbitmq:3-management
+```
+
+Start the listener first, then the emitter in a second terminal. Both must use
+the same `BENCH_EVENT_NAME`:
+
+```bash
+# terminal 1
+go run ./examples/rabbitmq/benchmark-listen-event
+
+# terminal 2, after the listener prints "waiting for the first event"
+go run ./examples/rabbitmq/benchmark-emit-event
+```
+
+| Variable | Default | Used by | Description |
+|----------|---------|---------|-------------|
+| `BENCH_EVENT_NAME` | `benchmark.event` | both | Event name to publish/listen for. No wildcards. |
+| `BENCH_DURATION` | `5m` | both | Measurement window (`time.ParseDuration`). |
+| `BENCH_APP_NAME` | `bench-emitter` / `bench-listener` | both | The listener appends a unique run suffix so each run starts with an empty queue. |
+| `BENCH_PUBLISHERS` | `16` | emitter | Concurrent `Emit` workers. The sender serializes writes on one channel, so this mainly pipelines confirms. |
+| `BENCH_PERSISTENT` | `true` | emitter | Publish persistent events (library default). |
+| `BENCH_SEND_TIMEOUT` | `10s` | emitter | Guard for a single send. |
+| `BENCH_PREFETCH` | `250` | listener | Consumer QoS prefetch. |
+| `BENCH_START_TIMEOUT` | `2m` | listener | How long to wait for the first event before failing. |
+| `RABBITMQ_HOST`, `RABBITMQ_PORT`, `RABBITMQ_USERNAME`, `RABBITMQ_PASSWORD`, `RABBITMQ_VHOST` | library defaults | both | Broker connection overrides. |
+
+Notes:
+
+- The listener starts measuring at the first delivered event, so the emitter's
+  compile/start time is excluded.
+- An emitter-only run publishes to an exchange with no bound queue; RabbitMQ
+  discards the events, so TPS is higher than a real fan-out. Run both examples
+  for representative numbers.
+- Old `bench-listener-*` queues remain bound to the event and keep receiving
+  copies. Delete them (management UI or `rabbitmqctl delete_queue`) or use a
+  disposable broker/vhost between runs.
+- Numbers are machine-dependent; use them for relative comparisons on the same
+  host.
+
+---
+
 ## Java Interoperability
 
 No special configuration is required. Both Go and Java services use the same default exchange
@@ -247,6 +311,9 @@ Use `rabbit.NewConfigWithDefaults()` to get a config pre-populated with all defa
   the consumer goroutine continues processing subsequent messages.
 - **RabbitMQ dead-letter queues**: set `WithDLQRetry: true` to automatically declare a DLQ exchange
   and queue (`{exchange}.DLQ`) so failed messages can be inspected or replayed.
+- **Live health**: `app.Health()` reports the connection state and every consumer's state/error for
+  readiness probes. `Ready()` is a one-shot startup signal; `Health()` reflects later reconnects and
+  consumer rebuilds. See [resilience.md](docs/resilience.md#live-health-and-readiness).
 - **Kafka retries**: event and command handler failures retry with backoff and then go to a
     topic DLQ. Kafka query handlers have no retry/DLQ path, and notification handler failures are
     dropped. See [Kafka support](docs/kafka.md) for delivery limitations.

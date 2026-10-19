@@ -12,7 +12,7 @@ COPY . .
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" \
-        -o /out/sender ./examples/async-sender-client
+        -o /out/sender ./examples/rabbitmq/async-sender-client
 
 FROM alpine:3.20
 RUN addgroup -S app && adduser -S -G app app

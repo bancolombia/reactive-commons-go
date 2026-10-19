@@ -2,8 +2,11 @@ package rabbit
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bancolombia/reactive-commons-go/internal/replyrouter"
@@ -19,9 +22,22 @@ type RabbitApp struct {
 	ready      chan struct{}
 	shutdownWg sync.WaitGroup
 
+	// restoreWg tracks in-flight consumer-restore goroutines. Shutdown waits
+	// on it before shutdownWg so no listener start can add to shutdownWg
+	// after its Wait has begun (an invalid WaitGroup use that would panic).
+	restoreWg    sync.WaitGroup
+	shutdownMu   sync.Mutex
+	shuttingDown bool
+
 	mu  sync.RWMutex
 	bus async.DomainEventBus
 	gw  async.DirectAsyncGateway
+
+	// conn and consumers back the Health snapshot. They are populated in Start
+	// and never changed afterwards (except conn, which is stable for the life
+	// of the app).
+	conn      *Connection
+	consumers []namedConsumer
 
 	// Stable per-process names for the auto-delete temp queues. These are
 	// generated once on Start and reused on every reconnect so the broker
@@ -39,6 +55,10 @@ type RabbitApp struct {
 	eventL *eventListener
 	cmdL   *commandListener
 	qL     *queryListener
+
+	// restoreGen is bumped by every reconnect hook invocation; a consumer
+	// restore retry loop exits when a newer generation supersedes it.
+	restoreGen uint64
 }
 
 // NewRabbitApp creates a new RabbitApp. Call Start to connect and begin processing.
@@ -76,6 +96,9 @@ func (a *RabbitApp) Start(ctx context.Context) error {
 	if err := conn.DialContext(ctx); err != nil {
 		return err
 	}
+	a.mu.Lock()
+	a.conn = conn
+	a.mu.Unlock()
 
 	a.replyQueueName = utils.GenerateTempName(a.cfg.AppName, "replies")
 	if len(a.reg.NotificationNames()) > 0 {
@@ -84,6 +107,9 @@ func (a *RabbitApp) Start(ctx context.Context) error {
 
 	sender, err := NewSender(conn, a.cfg)
 	if err != nil {
+		// Close the connection and its watcher goroutine — failing to do so
+		// would leak a live broker connection on a failed Start.
+		_ = conn.Close()
 		return err
 	}
 
@@ -91,32 +117,40 @@ func (a *RabbitApp) Start(ctx context.Context) error {
 	replyRouter := replyrouter.NewReplyRouter()
 	gw.withReplySupport(a.replyQueueName, replyRouter)
 
-	a.replyL = newReplyListener(conn, replyRouter, a.cfg, &a.shutdownWg)
+	// ensureTopology is invoked by a listener's self-heal before rebuilding a
+	// broker-killed channel, so a queue deleted while the connection stayed
+	// up is recreated instead of failing the rebuild forever.
+	ensureTopology := func() error { return a.declareTopology(conn) }
+
+	a.replyL = newReplyListener(conn, replyRouter, a.cfg, &a.shutdownWg, ensureTopology)
 	if a.notificationQueueName != "" {
-		a.notifL = newNotificationListener(conn, a.reg, a.cfg, &a.shutdownWg)
+		a.notifL = newNotificationListener(conn, a.reg, a.cfg, &a.shutdownWg, ensureTopology)
 	}
 	if len(a.reg.EventNames()) > 0 {
-		a.eventL = newEventListener(conn, a.reg, a.cfg, &a.shutdownWg)
+		a.eventL = newEventListener(conn, a.reg, a.cfg, &a.shutdownWg, ensureTopology)
 	}
 	if len(a.reg.CommandNames()) > 0 {
-		a.cmdL = newCommandListener(conn, a.reg, a.cfg, &a.shutdownWg)
+		a.cmdL = newCommandListener(conn, a.reg, a.cfg, &a.shutdownWg, ensureTopology)
 	}
 	if len(a.reg.QueryNames()) > 0 {
-		a.qL = newQueryListener(conn, a.reg, gw, a.cfg, &a.shutdownWg)
+		a.qL = newQueryListener(conn, a.reg, gw, a.cfg, &a.shutdownWg, ensureTopology)
 	}
 
 	a.mu.Lock()
 	a.bus = newEventBus(sender, a.cfg)
 	a.gw = gw
+	a.consumers = a.namedConsumers()
 	a.mu.Unlock()
 
 	if err := a.bringUpConsumers(ctx, conn); err != nil {
+		_ = conn.Close()
 		return err
 	}
 
 	// Order matters: rebuild the publisher channel BEFORE redeclaring
 	// consumers, so a query that arrives the instant a listener restarts
-	// always has a live publisher channel available for gw.Reply.
+	// always has a live publisher channel available for gw.Reply. If the
+	// first rebuild attempt fails, Reconnect keeps retrying in the background.
 	conn.OnReconnect(func() {
 		if err := sender.Reconnect(); err != nil {
 			a.log.Error("reactive-commons: failed to rebuild publisher channel after reconnect", "error", err)
@@ -124,19 +158,39 @@ func (a *RabbitApp) Start(ctx context.Context) error {
 	})
 	conn.OnReconnect(func() {
 		a.log.Info("reactive-commons: re-declaring topology and restarting consumers after reconnect")
-		if err := a.bringUpConsumers(ctx, conn); err != nil {
-			a.log.Error("reactive-commons: failed to restore consumers after reconnect", "error", err)
+		gen := atomic.AddUint64(&a.restoreGen, 1)
+
+		// Once shutdown has begun, skip the restore: its listener starts
+		// would add to shutdownWg after its Wait, which is invalid WaitGroup
+		// use and panics on Done.
+		a.shutdownMu.Lock()
+		if a.shuttingDown {
+			a.shutdownMu.Unlock()
+			return
 		}
+		a.restoreWg.Add(1)
+		a.shutdownMu.Unlock()
+
+		go func() {
+			defer a.restoreWg.Done()
+			a.restoreConsumers(ctx, conn, gen)
+		}()
 	})
 
 	close(a.ready)
 
 	<-ctx.Done()
 
-	// Graceful shutdown: wait for all in-flight consumer goroutines to finish,
-	// with a 30-second hard deadline before forcing the connection closed.
+	// Graceful shutdown: stop new restores first, then wait for in-flight
+	// consumer goroutines to finish, with a 30-second hard deadline before
+	// forcing the connection closed.
+	a.shutdownMu.Lock()
+	a.shuttingDown = true
+	a.shutdownMu.Unlock()
+
 	shutdownDone := make(chan struct{})
 	go func() {
+		a.restoreWg.Wait()
 		a.shutdownWg.Wait()
 		close(shutdownDone)
 	}()
@@ -145,17 +199,138 @@ func (a *RabbitApp) Start(ctx context.Context) error {
 	case <-time.After(30 * time.Second):
 		a.log.Warn("reactive-commons: graceful shutdown timed out after 30s, forcing connection close")
 	}
+	// A handler may still be running past the drain deadline; it must not
+	// leave Health reporting a live consumer after Start returns.
+	a.markConsumersStopped()
 	return conn.Close()
+}
+
+// namedConsumer pairs a listener kind with its supervisor for Health snapshots.
+type namedConsumer struct {
+	name string
+	sup  *supervisedConsumer
+}
+
+// namedConsumers returns one reference per configured listener. Caller holds a.mu.
+func (a *RabbitApp) namedConsumers() []namedConsumer {
+	var refs []namedConsumer
+	if a.eventL != nil {
+		refs = append(refs, namedConsumer{name: "event", sup: a.eventL.sup})
+	}
+	if a.cmdL != nil {
+		refs = append(refs, namedConsumer{name: "command", sup: a.cmdL.sup})
+	}
+	if a.qL != nil {
+		refs = append(refs, namedConsumer{name: "query", sup: a.qL.sup})
+	}
+	refs = append(refs, namedConsumer{name: "reply", sup: a.replyL.sup})
+	if a.notifL != nil {
+		refs = append(refs, namedConsumer{name: "notification", sup: a.notifL.sup})
+	}
+	return refs
+}
+
+// Health returns a point-in-time snapshot of the connection and every
+// configured consumer. Safe to call at any time, including before Start (idle)
+// and after shutdown (stopped).
+func (a *RabbitApp) Health() Health {
+	a.mu.RLock()
+	conn := a.conn
+	refs := append([]namedConsumer(nil), a.consumers...)
+	a.mu.RUnlock()
+
+	h := Health{Consumers: make(map[string]ConsumerHealth, len(refs))}
+	select {
+	case <-a.ready:
+		h.Ready = true
+	default:
+	}
+
+	if conn == nil {
+		h.Connection = ConnectionHealth{State: ConnectionIdle}
+	} else {
+		h.Connection = conn.healthSnapshot()
+	}
+
+	healthy := h.Ready && h.Connection.State == ConnectionConnected
+	for _, ref := range refs {
+		ch := ref.sup.snapshot()
+		h.Consumers[ref.name] = ch
+		if ch.State != ConsumerRunning {
+			healthy = false
+		}
+	}
+	h.Healthy = healthy
+	return h
+}
+
+// markConsumersStopped forces every consumer health state to stopped after the
+// shutdown drain, so a handler outliving the deadline cannot look healthy.
+func (a *RabbitApp) markConsumersStopped() {
+	a.mu.RLock()
+	refs := append([]namedConsumer(nil), a.consumers...)
+	a.mu.RUnlock()
+	for _, ref := range refs {
+		ref.sup.markStopped()
+	}
+}
+
+// restoreConsumers keeps retrying bringUpConsumers with exponential backoff
+// until it succeeds, the app context is cancelled, or a newer reconnect
+// supersedes this attempt. Runs in its own goroutine so the reconnect hook
+// (and thus the watchClose handoff in reconnectLoop) is never blocked.
+// Publishing stays available throughout because the sender was rebuilt by the
+// earlier hook, so messages queue broker-side and are consumed once the
+// consumers return. Every failed attempt is logged at error level — a
+// half-restored app must not look healthy.
+func (a *RabbitApp) restoreConsumers(ctx context.Context, conn *Connection, gen uint64) {
+	restoreWithBackoff(ctx, gen, &a.restoreGen, a.log, func() error {
+		return a.bringUpConsumers(ctx, conn)
+	})
+}
+
+// restoreWithBackoff retries attempt with exponential backoff (1s → 30s cap)
+// until it succeeds or ctx is cancelled, and exits early when the restore
+// generation has moved on. Each failure is logged at error level.
+func restoreWithBackoff(ctx context.Context, gen uint64, current *uint64, log *slog.Logger, attempt func() error) {
+	backoff := 1 * time.Second
+	const maxBackoff = 30 * time.Second
+	for {
+		if atomic.LoadUint64(current) != gen {
+			return
+		}
+		if err := attempt(); err == nil {
+			log.Info("reactive-commons: consumers restored")
+			return
+		} else {
+			log.Error("reactive-commons: failed to restore consumers after reconnect; retrying", "error", err, "delay", backoff)
+		}
+		select {
+		case <-time.After(backoff):
+		case <-ctx.Done():
+			return
+		}
+		backoff = min(backoff*2, maxBackoff)
+	}
 }
 
 // bringUpConsumers (re)declares the consumer-side topology and starts every
 // listener. Safe to call both at first connect and from the reconnect hook:
 // queue declarations are idempotent for durable queues, and the auto-delete
 // temp queues are always recreated under the same stable names. Each listener
-// opens a fresh channel and spawns a new goroutine; the previous goroutine
-// (if any) has already exited because its deliveries channel was closed by
-// the AMQP library when the connection dropped.
+// opens a fresh channel and spawns a new supervisor goroutine, which
+// supersedes any previous one (stopping it before it can double-consume).
 func (a *RabbitApp) bringUpConsumers(ctx context.Context, conn *Connection) error {
+	if err := a.declareTopology(conn); err != nil {
+		return err
+	}
+	return a.startListeners(ctx)
+}
+
+// declareTopology declares exchanges, queues and bindings on a throwaway
+// channel. Also used by consumer channel self-healing to re-create topology
+// that may have been deleted while the connection stayed up.
+func (a *RabbitApp) declareTopology(conn *Connection) error {
 	topoCh, err := conn.Channel()
 	if err != nil {
 		return err
@@ -179,34 +354,38 @@ func (a *RabbitApp) bringUpConsumers(ctx context.Context, conn *Connection) erro
 	if err := a.declareNotifications(topo); err != nil {
 		return err
 	}
-	if err := a.declareReplies(topo); err != nil {
-		return err
+	return a.declareReplies(topo)
+}
+
+// startListeners starts every registered listener. Each start supersedes the
+// listener's previous consumer supervisor, so a retried bringUpConsumers can
+// never leave two consumers running on the same queue.
+func (a *RabbitApp) startListeners(ctx context.Context) error {
+	// Attempt every listener: one listener failing to start must not prevent
+	// the others from coming up after a reconnect. Retries from
+	// restoreWithBackoff are safe because start is idempotent (it supersedes
+	// the previous supervisor).
+	var errs []error
+	start := func(kind string, fn func() error) {
+		if err := fn(); err != nil {
+			errs = append(errs, fmt.Errorf("%s listener: %w", kind, err))
+		}
 	}
 
 	if a.eventL != nil {
-		if err := a.eventL.Start(ctx, a.cfg.AppName+".subsEvents"); err != nil {
-			return err
-		}
+		start("event", func() error { return a.eventL.Start(ctx, a.cfg.AppName+".subsEvents") })
 	}
 	if a.cmdL != nil {
-		if err := a.cmdL.Start(ctx, a.cfg.AppName); err != nil {
-			return err
-		}
+		start("command", func() error { return a.cmdL.Start(ctx, a.cfg.AppName) })
 	}
 	if a.qL != nil {
-		if err := a.qL.Start(ctx, a.cfg.AppName+".query"); err != nil {
-			return err
-		}
+		start("query", func() error { return a.qL.Start(ctx, a.cfg.AppName+".query") })
 	}
-	if err := a.replyL.Start(ctx, a.replyQueueName); err != nil {
-		return err
-	}
+	start("reply", func() error { return a.replyL.Start(ctx, a.replyQueueName) })
 	if a.notifL != nil {
-		if err := a.notifL.Start(ctx, a.notificationQueueName); err != nil {
-			return err
-		}
+		start("notification", func() error { return a.notifL.Start(ctx, a.notificationQueueName) })
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 func (a *RabbitApp) declareEvents(topo *Topology) error {

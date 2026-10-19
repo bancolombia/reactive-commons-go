@@ -39,6 +39,19 @@ func (a *restAPI) register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/teams/{team}/members", a.addMember)
 	mux.HandleFunc("DELETE /api/teams/{team}/members/{member}", a.removeMember)
 	mux.HandleFunc("GET /api/animals/{event}", a.wildCardEvent)
+	mux.HandleFunc("GET /health", a.health)
+}
+
+// health exposes the live Application.Health() snapshot. Unlike Ready(), which
+// is a one-shot startup signal, it reflects reconnects and consumer rebuilds,
+// so it is suitable for Kubernetes readiness/liveness probes.
+func (a *restAPI) health(w http.ResponseWriter, _ *http.Request) {
+	h := a.app.Health()
+	status := http.StatusOK
+	if !h.Healthy {
+		status = http.StatusServiceUnavailable
+	}
+	a.writeJSON(w, status, h)
 }
 
 // resetData mirrors `DELETE /api/teams` on the Java sample. The Java code
@@ -214,11 +227,15 @@ func (a *restAPI) writeJSON(w http.ResponseWriter, status int, body any) {
 }
 
 // writeError logs the operation that failed and emits a JSON error envelope.
-// Status code is 504 on context-deadline / query timeout errors, 500 otherwise.
+// Status code is 503 when the broker is unavailable, 504 on context-deadline /
+// query timeout errors, and 500 otherwise.
 func (a *restAPI) writeError(w http.ResponseWriter, r *http.Request, op string, err error) {
 	status := http.StatusInternalServerError
-	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, async.ErrQueryTimeout) {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, async.ErrQueryTimeout):
 		status = http.StatusGatewayTimeout
+	case errors.Is(err, async.ErrBrokerUnavailable):
+		status = http.StatusServiceUnavailable
 	}
 	a.log.Error("request failed", "op", op, "method", r.Method, "path", r.URL.Path, "error", err)
 	a.writeJSON(w, status, map[string]string{"error": err.Error(), "op": op})

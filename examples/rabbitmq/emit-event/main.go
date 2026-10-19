@@ -35,15 +35,20 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	appErrCh := make(chan error, 1)
 	go func() {
-		if err := app.Start(ctx); err != nil {
-			logger.Error("application stopped with error", "error", err)
-		}
+		appErrCh <- app.Start(ctx)
 	}()
 
-	// Wait until the broker topology is ready before publishing
-	<-app.Ready()
-	logger.Info("application ready, starting to emit events")
+	// Wait until the broker topology is ready before publishing. Also watch for
+	// a startup failure so an unreachable broker does not block forever.
+	select {
+	case <-app.Ready():
+		logger.Info("application ready, starting to emit events")
+	case err := <-appErrCh:
+		logger.Error("application stopped before ready", "error", err)
+		return
+	}
 
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
@@ -65,7 +70,12 @@ func main() {
 				Data:    orderData,
 			}
 
-			if err := app.EventBus().Emit(ctx, event); err != nil {
+			// Bound each send: SendWithConfirm returns when the broker confirms
+			// or the context expires.
+			emitCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			err := app.EventBus().Emit(emitCtx, event)
+			cancel()
+			if err != nil {
 				logger.Error("failed to emit event", "error", err)
 				continue
 			}
