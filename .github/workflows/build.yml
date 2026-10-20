@@ -137,6 +137,7 @@ jobs:
 #          files: ./coverage.out
 
       - name: Analyze with SonarQube
+        if: ${{ !contains(github.event.pull_request.head.ref, 'dependabot/') }}
         uses: SonarSource/sonarqube-scan-action@fd88b7d7ccbaefd23d8f36f73b59db7a3d246602 # v6
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
