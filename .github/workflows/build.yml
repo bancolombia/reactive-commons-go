@@ -130,26 +130,3 @@ jobs:
         run: |
           go tool covdata textfmt -i=coverage.covdata/unit,coverage.covdata/integration -o=coverage.out
 
-#      - name: Upload coverage to Codecov
-#        uses: codecov/codecov-action@v5
-#        with:
-#          # token: ${{ secrets.CODECOV_TOKEN }}
-#          files: ./coverage.out
-
-      - name: Analyze with SonarQube
-        uses: SonarSource/sonarqube-scan-action@fd88b7d7ccbaefd23d8f36f73b59db7a3d246602 # v6
-        env:
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-        with:
-          # Project metadata can be defined here or in a sonar-project.properties file
-          args: >
-            -Dsonar.projectKey=bancolombia_reactive-commons-go
-            -Dsonar.organization=grupo-bancolombia
-            -Dsonar.sources=.
-            -Dsonar.coverage.exclusions=**/*_test.go,**/examples/**,tests/integration/kafka/interop/**
-            -Dsonar.exclusions=**/*_test.go,**/examples/**
-            -Dsonar.tests=.
-            -Dsonar.test.inclusions=**/*_test.go
-            -Dsonar.go.coverage.reportPaths=coverage.out
-            -Dsonar.qualitygate.wait=true
-            -Dsonar.branch.name=${{ github.ref_name }}
