@@ -68,15 +68,11 @@ func TestListen_RetryAndDLQ(t *testing.T) {
 	bodyBytes, err := json.Marshal(body)
 	require.NoError(t, err)
 
-	w := &kgo.Writer{Addr: kgo.TCP(brokers...), Balancer: &kgo.Hash{}}
-	defer w.Close()
-	pubCtx, pubCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer pubCancel()
-	require.NoError(t, w.WriteMessages(pubCtx, kgo.Message{
+	publishRaw(t, brokers, kgo.Message{
 		Topic: topic,
 		Key:   []byte(body["eventId"].(string)),
 		Value: bodyBytes,
-	}))
+	})
 
 	dlqReader := kgo.NewReader(kgo.ReaderConfig{
 		Brokers:     brokers,
