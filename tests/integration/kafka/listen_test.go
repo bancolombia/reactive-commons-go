@@ -73,13 +73,7 @@ func TestListen_ConsumesEnvelope(t *testing.T) {
 	bodyBytes, err := json.Marshal(envelopeBody)
 	require.NoError(t, err)
 
-	w := &kgo.Writer{
-		Addr:                   kgo.TCP(brokers...),
-		Balancer:               &kgo.Hash{},
-		AllowAutoTopicCreation: true,
-	}
-	defer w.Close()
-	writeMsg := kgo.Message{
+	publishRaw(t, brokers, kgo.Message{
 		Topic: topic,
 		Key:   []byte(envelopeBody["eventId"].(string)),
 		Value: bodyBytes,
@@ -87,18 +81,7 @@ func TestListen_ConsumesEnvelope(t *testing.T) {
 			{Key: "content-type", Value: []byte("application/json")},
 			{Key: "reactive-commons-kind", Value: []byte("event")},
 		},
-	}
-	var writeErr error
-	for i := 0; i < 10; i++ {
-		pubCtx, pubCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		writeErr = w.WriteMessages(pubCtx, writeMsg)
-		pubCancel()
-		if writeErr == nil {
-			break
-		}
-		time.Sleep(500 * time.Millisecond)
-	}
-	require.NoError(t, writeErr, "raw envelope publish should succeed within retries")
+	})
 
 	select {
 	case msg := <-received:

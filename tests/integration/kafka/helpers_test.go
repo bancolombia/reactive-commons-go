@@ -10,6 +10,7 @@ import (
 
 	rckafka "github.com/bancolombia/reactive-commons-go/kafka"
 	"github.com/google/uuid"
+	kgo "github.com/segmentio/kafka-go"
 	"github.com/stretchr/testify/require"
 )
 
@@ -50,4 +51,31 @@ func startAppWith(t *testing.T, brokers []string, appName string, mutate func(cf
 		t.Fatalf("app %s did not become ready within 30s", appName)
 	}
 	return &runningApp{app: app, appName: appName, cancel: cancel}
+}
+
+// publishRaw writes msgs with a bare kafka-go Writer, retrying on transient
+// errors. kafka-go fails fast on UnknownTopicOrPartition from its per-write
+// metadata lookup, which races topics that were just created while the
+// broker's metadata cache catches up; retrying (with auto-create enabled on
+// the writer) lets the broker settle.
+func publishRaw(t *testing.T, brokers []string, msgs ...kgo.Message) {
+	t.Helper()
+	w := &kgo.Writer{
+		Addr:                   kgo.TCP(brokers...),
+		Balancer:               &kgo.Hash{},
+		AllowAutoTopicCreation: true,
+	}
+	defer w.Close()
+
+	var lastErr error
+	for i := 0; i < 10; i++ {
+		pubCtx, pubCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		lastErr = w.WriteMessages(pubCtx, msgs...)
+		pubCancel()
+		if lastErr == nil {
+			return
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	require.NoError(t, lastErr, "raw publish should succeed within retries")
 }
